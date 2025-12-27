@@ -1,10 +1,23 @@
-name = "nautica"
+name = "last-rite"
 main = "_worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat_v2"]
 
-[unsafe.metadata.observability]
-enabled = true
+# Custom Routes
+routes = [
+  { pattern = "hoshiyomi.qzz.io", custom_domain = true },
+  { pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io", custom_domain = true }
+]
 
-[observability.logs]
-enabled = true
+# KV Namespace Binding
+[[kv_namespaces]]
+binding = "KV_CACHE"
+id = "a9f61fcc3abf48af91a5924027ee1a1a"
+
+# Observability Configuration (Temporarily Disabled)
+# [observability]
+# enabled = true
+
+# [observability.logs]
+# enabled = true
+# invocation_logs = true

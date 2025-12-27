@@ -3,19 +3,14 @@ import { connect } from "cloudflare:sockets";
 // Variables
 let serviceName = "";
 let APP_DOMAIN = "";
-
 let prxIP = "";
-let cachedPrxList = [];
-let cacheTimestamp = 0;
-const CACHE_TTL = 3600000; // 1 hour in milliseconds
 
-// Constant
+// Constants - Pre-computed for performance
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const v2 = "djJyYXk=";
 const neko = "Y2xhc2g=";
 
-// Pre-computed constants (optimization)
 const PROTOCOL_HORSE = atob(horse);
 const PROTOCOL_FLASH = atob(flash);
 const PROTOCOL_V2 = atob(v2);
@@ -43,9 +38,25 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Max-Age": "86400",
 };
 
-// Connection timeout constants
-const CONNECTION_TIMEOUT_MS = 25000; // 25 seconds
-const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+// Timeout constants
+const CONNECTION_TIMEOUT_MS = 25000;
+const HEALTH_CHECK_TIMEOUT_MS = 5000;
+const CONVERTER_TIMEOUT_MS = 8000;
+const MAX_CONFIGS_PER_REQUEST = 20;
+
+// EFFICIENCY TWEAK #1: Differentiated cache TTL based on data volatility
+const CACHE_TTL = {
+  KV_PRX_LIST: 1800,      // 30 min - semi-static KV mappings
+  PRX_LIST: 3600,         // 1 hour - proxy list changes moderately  
+  HEALTH_CHECK: 300,      // 5 min - health status is volatile
+};
+
+// EFFICIENCY TWEAK #6: Health check concurrency control
+const HEALTH_CHECK_CONCURRENCY = 10;
+
+// ============================================================================
+// OPTIMIZED: KV-only caching with differentiated TTL
+// ============================================================================
 
 async function getKVPrxList(kvPrxUrl = KV_PRX_URL, env) {
   if (!kvPrxUrl) {
@@ -54,33 +65,42 @@ async function getKVPrxList(kvPrxUrl = KV_PRX_URL, env) {
 
   // Try KV cache first
   if (env?.KV_CACHE) {
-    const cached = await env.KV_CACHE.get("kv_prx_list", "json");
-    if (cached) {
-      return cached;
+    try {
+      const cached = await env.KV_CACHE.get("kv_prx_list", "json");
+      if (cached) {
+        return cached;
+      }
+    } catch (err) {
+      console.error("KV cache read error:", err);
     }
   }
 
+  // Fetch from remote
   const kvPrx = await fetch(kvPrxUrl);
-  if (kvPrx.status == 200) {
+  if (kvPrx.status === 200) {
     const data = await kvPrx.json();
     
-    // Cache for future requests
+    // Store in KV with differentiated TTL
     if (env?.KV_CACHE) {
-      await env.KV_CACHE.put("kv_prx_list", JSON.stringify(data), {
-        expirationTtl: 3600, // 1 hour
-      });
+      try {
+        await env.KV_CACHE.put("kv_prx_list", JSON.stringify(data), {
+          expirationTtl: CACHE_TTL.KV_PRX_LIST,
+        });
+      } catch (err) {
+        console.error("KV cache write error:", err);
+      }
     }
     
     return data;
-  } else {
-    return {};
   }
+  
+  return {};
 }
 
 async function getPrxListPaginated(prxBankUrl = PRX_BANK_URL, options = {}, env) {
   /**
+   * OPTIMIZED: KV-only implementation with differentiated TTL
    * Format: <IP>,<Port>,<Country ID>,<ORG>
-   * Streaming parser with pagination support
    */
   if (!prxBankUrl) {
     throw new Error("No URL Provided!");
@@ -92,69 +112,73 @@ async function getPrxListPaginated(prxBankUrl = PRX_BANK_URL, options = {}, env)
     filterCC = [],
   } = options;
 
-  // Check in-memory cache with TTL
-  const now = Date.now();
-  if (cachedPrxList.length > 0 && (now - cacheTimestamp) < CACHE_TTL) {
-    return paginateArray(cachedPrxList, offset, limit, filterCC);
-  }
-
   // Try KV cache
   if (env?.KV_CACHE) {
-    const cached = await env.KV_CACHE.get("prx_list", "json");
-    if (cached) {
-      cachedPrxList = cached;
-      cacheTimestamp = now;
-      return paginateArray(cachedPrxList, offset, limit, filterCC);
+    try {
+      const cached = await env.KV_CACHE.get("prx_list", "json");
+      if (cached && Array.isArray(cached)) {
+        return paginateArray(cached, offset, limit, filterCC);
+      }
+    } catch (err) {
+      console.error("KV cache read error:", err);
     }
   }
 
-  // Fetch and parse (only if not cached)
+  // Fetch and parse
   const prxBank = await fetch(prxBankUrl);
-  if (prxBank.status == 200) {
+  let prxList = [];
+  
+  if (prxBank.status === 200) {
     const text = (await prxBank.text()) || "";
     const prxString = text.split("\n").filter(Boolean);
     
-    cachedPrxList = prxString
+    prxList = prxString
       .map((entry) => {
         const [prxIP, prxPort, country, org] = entry.split(",");
+        if (!prxIP || !prxPort) return null;
         return {
-          prxIP: prxIP || "Unknown",
-          prxPort: prxPort || "Unknown",
-          country: country || "Unknown",
-          org: org || "Unknown Org",
+          prxIP: prxIP.trim(),
+          prxPort: prxPort.trim(),
+          country: country?.trim() || "Unknown",
+          org: org?.trim() || "Unknown Org",
         };
       })
       .filter(Boolean);
-    
-    cacheTimestamp = now;
 
-    // Store in KV for cross-request caching
-    if (env?.KV_CACHE) {
-      await env.KV_CACHE.put("prx_list", JSON.stringify(cachedPrxList), {
-        expirationTtl: 3600, // 1 hour
-      });
+    // Store in KV with differentiated TTL
+    if (env?.KV_CACHE && prxList.length > 0) {
+      try {
+        await env.KV_CACHE.put("prx_list", JSON.stringify(prxList), {
+          expirationTtl: CACHE_TTL.PRX_LIST,
+        });
+      } catch (err) {
+        console.error("KV cache write error:", err);
+      }
     }
   }
 
-  return paginateArray(cachedPrxList, offset, limit, filterCC);
+  return paginateArray(prxList, offset, limit, filterCC);
 }
 
+// ============================================================================
+// EFFICIENCY TWEAK #4: Reduced nested loop complexity
+// ============================================================================
+
 function paginateArray(array, offset, limit, filterCC) {
+  // Apply country filter first
   let filtered = array;
-  
-  // Apply country filter
   if (filterCC.length > 0) {
     filtered = array.filter((prx) => filterCC.includes(prx.country));
   }
   
-  // Shuffle for randomization
-  shuffleArray(filtered);
-  
   const total = filtered.length;
-  const paginated = filtered.slice(offset, offset + limit);
+  
+  // Slice first, then shuffle (performance boost)
+  const sliced = filtered.slice(offset, offset + limit);
+  shuffleArray(sliced);
   
   return {
-    data: paginated,
+    data: sliced,
     pagination: {
       offset,
       limit,
@@ -196,35 +220,49 @@ export default {
 
       const upgradeHeader = request.headers.get("Upgrade");
 
-      // Handle prx client
+      // Handle WebSocket proxy client
       if (upgradeHeader === "websocket") {
         const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
 
-        if (url.pathname.length == 3 || url.pathname.match(",")) {
+        if (url.pathname.length === 3 || url.pathname.match(",")) {
           const prxKeys = url.pathname.replace("/", "").toUpperCase().split(",");
           const prxKey = prxKeys[Math.floor(Math.random() * prxKeys.length)];
           const kvPrx = await getKVPrxList(KV_PRX_URL, env);
 
-          prxIP = kvPrx[prxKey][Math.floor(Math.random() * kvPrx[prxKey].length)];
-          return await websocketHandler(request);
+          if (kvPrx[prxKey] && kvPrx[prxKey].length > 0) {
+            prxIP = kvPrx[prxKey][Math.floor(Math.random() * kvPrx[prxKey].length)];
+            return await websocketHandler(request);
+          }
+          
+          return new Response("Proxy key not found", { status: 404 });
         } else if (prxMatch) {
           prxIP = prxMatch[1];
           return await websocketHandler(request);
         }
       }
 
+      // Redirect to subscription page
       if (url.pathname.startsWith("/sub")) {
         return Response.redirect(SUB_PAGE_URL + `?host=${APP_DOMAIN}`, 301);
-      } else if (url.pathname.startsWith("/check")) {
-        const target = url.searchParams.get("target").split(":");
+      }
+      
+      // Health check endpoint with timeout
+      if (url.pathname.startsWith("/check")) {
+        const targetParam = url.searchParams.get("target");
+        if (!targetParam) {
+          return new Response(JSON.stringify({ error: "Missing target parameter" }), {
+            status: 400,
+            headers: { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" },
+          });
+        }
         
-        // Use waitUntil for non-critical health checks
+        const target = targetParam.split(":");
         const resultPromise = checkPrxHealth(target[0], target[1] || "443");
         
         const result = await Promise.race([
           resultPromise,
           new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("Health check timeout")), 5000)
+            setTimeout(() => reject(new Error("Health check timeout")), HEALTH_CHECK_TIMEOUT_MS)
           ),
         ]).catch(err => ({ error: err.message }));
 
@@ -233,25 +271,27 @@ export default {
           headers: {
             ...CORS_HEADER_OPTIONS,
             "Content-Type": "application/json",
-            "Cache-Control": "public, max-age=300", // 5 min cache
+            "Cache-Control": "public, max-age=300",
           },
         });
-      } else if (url.pathname.startsWith("/api/v1")) {
+      }
+      
+      // API endpoints
+      if (url.pathname.startsWith("/api/v1")) {
         const apiPath = url.pathname.replace("/api/v1", "");
 
+        // Subscription config generator
         if (apiPath.startsWith("/sub")) {
-          // CRITICAL OPTIMIZATION: Pagination support
           const offset = parseInt(url.searchParams.get("offset")) || 0;
-          const filterCC = url.searchParams.get("cc")?.split(",") || [];
-          const filterPort = url.searchParams.get("port")?.split(",") || PORTS;
-          const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
+          const filterCC = url.searchParams.get("cc")?.split(",").filter(Boolean) || [];
+          const filterPort = url.searchParams.get("port")?.split(",").map(p => parseInt(p)).filter(Boolean) || PORTS;
+          const filterVPN = url.searchParams.get("vpn")?.split(",").filter(Boolean) || PROTOCOLS;
           const filterLimit = Math.min(
             parseInt(url.searchParams.get("limit")) || MAX_CONFIGS_PER_REQUEST,
-            MAX_CONFIGS_PER_REQUEST // Hard cap
+            MAX_CONFIGS_PER_REQUEST
           );
           const filterFormat = url.searchParams.get("format") || "raw";
           const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
-
           const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
           
           // Get paginated proxy list
@@ -264,8 +304,13 @@ export default {
           const uuid = crypto.randomUUID();
           const result = [];
           
-          // OPTIMIZATION: Single loop with early break
+          // EFFICIENCY TWEAK #4: Pre-compute port/protocol combinations
+          const combinations = filterPort.flatMap(port =>
+            filterVPN.map(protocol => ({ port, protocol }))
+          );
+          
           let configCount = 0;
+          
           for (const prx of prxList) {
             if (configCount >= filterLimit) break;
             
@@ -274,44 +319,39 @@ export default {
             uri.searchParams.set("type", "ws");
             uri.searchParams.set("host", APP_DOMAIN);
 
-            for (const port of filterPort) {
+            for (const { port, protocol } of combinations) {
               if (configCount >= filterLimit) break;
+
+              uri.protocol = protocol;
+              uri.port = port.toString();
               
-              for (const protocol of filterVPN) {
-                if (configCount >= filterLimit) break;
-
-                uri.protocol = protocol;
-                uri.port = port.toString();
-                
-                if (protocol == "ss") {
-                  uri.username = btoa(`none:${uuid}`);
-                  uri.searchParams.set(
-                    "plugin",
-                    `${PROTOCOL_V2}-plugin${port == 80 ? "" : ";tls"};mux=0;mode=websocket;path=/${prx.prxIP}-${
-                      prx.prxPort
-                    };host=${APP_DOMAIN}`
-                  );
-                } else {
-                  uri.username = uuid;
-                }
-
-                uri.searchParams.set("security", port == 443 ? "tls" : "none");
-                uri.searchParams.set("sni", port == 80 && protocol == PROTOCOL_FLASH ? "" : APP_DOMAIN);
-                uri.searchParams.set("path", `/${prx.prxIP}-${prx.prxPort}`);
-
-                uri.hash = `${configCount + 1} ${getFlagEmoji(prx.country)} ${prx.org} WS ${
-                  port == 443 ? "TLS" : "NTLS"
-                } [${serviceName}]`;
-                
-                result.push(uri.toString());
-                configCount++;
+              if (protocol === "ss") {
+                uri.username = btoa(`none:${uuid}`);
+                uri.searchParams.set(
+                  "plugin",
+                  `${PROTOCOL_V2}-plugin${port === 80 ? "" : ";tls"};mux=0;mode=websocket;path=/${prx.prxIP}-${prx.prxPort};host=${APP_DOMAIN}`
+                );
+              } else {
+                uri.username = uuid;
               }
+
+              uri.searchParams.set("security", port === 443 ? "tls" : "none");
+              uri.searchParams.set("sni", port === 80 && protocol === PROTOCOL_FLASH ? "" : APP_DOMAIN);
+              uri.searchParams.set("path", `/${prx.prxIP}-${prx.prxPort}`);
+
+              const configName = `${configCount + 1} ${getFlagEmoji(prx.country)} ${prx.org} WS ${port === 443 ? "TLS" : "NTLS"} [${serviceName}]`;
+              uri.hash = configName;
+              
+              result.push(uri.toString());
+              configCount++;
             }
           }
 
+          // Prepare response
           let finalResult = "";
           const responseHeaders = {
             ...CORS_HEADER_OPTIONS,
+            "Content-Type": "text/plain; charset=utf-8",
             "X-Pagination-Offset": offset.toString(),
             "X-Pagination-Limit": filterLimit.toString(),
             "X-Pagination-Total": pagination.total.toString(),
@@ -325,19 +365,21 @@ export default {
           switch (filterFormat) {
             case "raw":
               finalResult = result.join("\n");
-              responseHeaders["Cache-Control"] = "public, max-age=1800"; // 30 min
+              responseHeaders["Cache-Control"] = "public, max-age=1800";
               break;
+              
             case PROTOCOL_V2:
               finalResult = btoa(result.join("\n"));
               responseHeaders["Cache-Control"] = "public, max-age=1800";
               break;
+              
             case PROTOCOL_NEKO:
             case "sfa":
             case "bfr":
-              // OPTIMIZATION: Move converter to waitUntil if possible
-              // For now, add timeout protection
+              // OPTIMIZED: Timeout protection for converter
               const converterPromise = fetch(CONVERTER_URL, {
                 method: "POST",
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   url: result.join(","),
                   format: filterFormat,
@@ -345,47 +387,63 @@ export default {
                 }),
               });
 
-              const res = await Promise.race([
+              const converterResult = await Promise.race([
                 converterPromise,
                 new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error("Converter timeout")), 8000)
+                  setTimeout(() => reject(new Error("Converter timeout")), CONVERTER_TIMEOUT_MS)
                 ),
-              ]).catch(err => {
-                return new Response(JSON.stringify({ error: "Converter service timeout" }), {
-                  status: 504,
-                  headers: { ...CORS_HEADER_OPTIONS },
-                });
-              });
+              ]).catch(() => null);
 
-              if (res.status == 200) {
-                finalResult = await res.text();
+              if (converterResult && converterResult.status === 200) {
+                finalResult = await converterResult.text();
                 responseHeaders["Cache-Control"] = "public, max-age=1800";
               } else {
-                return new Response(res.statusText, {
-                  status: res.status,
-                  headers: { ...CORS_HEADER_OPTIONS },
+                return new Response(JSON.stringify({ 
+                  error: "Converter service unavailable",
+                  fallback: "Use format=raw or format=v2ray instead"
+                }), {
+                  status: 503,
+                  headers: { 
+                    ...CORS_HEADER_OPTIONS,
+                    "Content-Type": "application/json",
+                  },
                 });
               }
               break;
+              
+            default:
+              return new Response(JSON.stringify({ 
+                error: "Invalid format. Supported: raw, v2ray, clash, sfa, bfr" 
+              }), {
+                status: 400,
+                headers: { 
+                  ...CORS_HEADER_OPTIONS,
+                  "Content-Type": "application/json",
+                },
+              });
           }
 
           return new Response(finalResult, {
             status: 200,
             headers: responseHeaders,
           });
-        } else if (apiPath.startsWith("/myip")) {
+        }
+        
+        // MyIP endpoint
+        if (apiPath.startsWith("/myip")) {
           return new Response(
             JSON.stringify({
-              ip:
-                request.headers.get("cf-connecting-ipv6") ||
-                request.headers.get("cf-connecting-ip") ||
-                request.headers.get("x-real-ip"),
-              colo: request.headers.get("cf-ray")?.split("-")[1],
+              ip: request.headers.get("cf-connecting-ipv6") ||
+                  request.headers.get("cf-connecting-ip") ||
+                  request.headers.get("x-real-ip") ||
+                  "Unknown",
+              colo: request.headers.get("cf-ray")?.split("-")[1] || "Unknown",
               ...request.cf,
             }),
             {
               headers: {
                 ...CORS_HEADER_OPTIONS,
+                "Content-Type": "application/json",
                 "Cache-Control": "private, max-age=60",
               },
             }
@@ -393,19 +451,29 @@ export default {
         }
       }
 
+      // Default: reverse proxy
       const targetReversePrx = env.REVERSE_PRX_TARGET || "example.com";
       return await reverseWeb(request, targetReversePrx);
+      
     } catch (err) {
-      console.error("Worker error:", err);
-      return new Response(`An error occurred: ${err.toString()}`, {
+      console.error("Worker error:", err.stack || err);
+      return new Response(JSON.stringify({ 
+        error: "Internal server error",
+        message: err.message 
+      }), {
         status: 500,
         headers: {
           ...CORS_HEADER_OPTIONS,
+          "Content-Type": "application/json",
         },
       });
     }
   },
 };
+
+// ============================================================================
+// WebSocket Handler
+// ============================================================================
 
 async function websocketHandler(request) {
   const webSocketPair = new WebSocketPair();
@@ -418,13 +486,11 @@ async function websocketHandler(request) {
   const log = (info, event) => {
     console.log(`[${addressLog}:${portLog}] ${info}`, event || "");
   };
+  
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
 
-  let remoteSocketWrapper = {
-    value: null,
-  };
+  let remoteSocketWrapper = { value: null };
   let isDNS = false;
 
   readableWebSocketStream
@@ -442,6 +508,7 @@ async function websocketHandler(request) {
               RELAY_SERVER_UDP
             );
           }
+          
           if (remoteSocketWrapper.value) {
             const writer = remoteSocketWrapper.value.writable.getWriter();
             await writer.write(chunk);
@@ -472,20 +539,10 @@ async function websocketHandler(request) {
           if (protocolHeader.isUDP) {
             if (protocolHeader.portRemote === 53) {
               isDNS = true;
-              return handleUDPOutbound(
-                DNS_SERVER_ADDRESS,
-                DNS_SERVER_PORT,
-                chunk,
-                webSocket,
-                protocolHeader.version,
-                log,
-                RELAY_SERVER_UDP
-              );
             }
-
             return handleUDPOutbound(
-              protocolHeader.addressRemote,
-              protocolHeader.portRemote,
+              protocolHeader.portRemote === 53 ? DNS_SERVER_ADDRESS : protocolHeader.addressRemote,
+              protocolHeader.portRemote === 53 ? DNS_SERVER_PORT : protocolHeader.portRemote,
               chunk,
               webSocket,
               protocolHeader.version,
@@ -505,15 +562,22 @@ async function websocketHandler(request) {
           );
         },
         close() {
-          log(`readableWebSocketStream is close`);
+          log(`readableWebSocketStream closed`);
         },
         abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
+          log(`readableWebSocketStream aborted`, JSON.stringify(reason));
         },
       })
     )
     .catch((err) => {
-      log("readableWebSocketStream pipeTo error", err);
+      // EFFICIENCY TWEAK #5: Categorized error handling
+      if (err.name === 'NetworkError') {
+        log("Network failure - connection dropped", err.message);
+      } else if (err.message.includes('timeout')) {
+        log("Connection timeout - proxy may be overloaded", err.message);
+      } else {
+        log("readableWebSocketStream error", err.message);
+      }
     });
 
   return new Response(null, {
@@ -522,26 +586,32 @@ async function websocketHandler(request) {
   });
 }
 
+// ============================================================================
+// Protocol Detection
+// ============================================================================
+
 async function protocolSniffer(buffer) {
   if (buffer.byteLength >= 62) {
     const horseDelimiter = new Uint8Array(buffer.slice(56, 60));
     if (horseDelimiter[0] === 0x0d && horseDelimiter[1] === 0x0a) {
-      if (horseDelimiter[2] === 0x01 || horseDelimiter[2] === 0x03 || horseDelimiter[2] === 0x7f) {
-        if (horseDelimiter[3] === 0x01 || horseDelimiter[3] === 0x03 || horseDelimiter[3] === 0x04) {
-          return PROTOCOL_HORSE;
-        }
+      if ((horseDelimiter[2] === 0x01 || horseDelimiter[2] === 0x03 || horseDelimiter[2] === 0x7f) &&
+          (horseDelimiter[3] === 0x01 || horseDelimiter[3] === 0x03 || horseDelimiter[3] === 0x04)) {
+        return PROTOCOL_HORSE;
       }
     }
   }
 
   const flashDelimiter = new Uint8Array(buffer.slice(1, 17));
-  // OPTIMIZATION: Use pre-compiled regex
   if (UUID_V4_REGEX.test(arrayBufferToHex(flashDelimiter))) {
     return PROTOCOL_FLASH;
   }
 
-  return "ss"; // default
+  return "ss";
 }
+
+// ============================================================================
+// EFFICIENCY TWEAK: Fixed connection leak with proper cleanup
+// ============================================================================
 
 async function handleTCPOutBound(
   remoteSocket,
@@ -553,7 +623,6 @@ async function handleTCPOutBound(
   log
 ) {
   async function connectAndWrite(address, port) {
-    // CRITICAL: Add connection timeout
     const connectPromise = new Promise(async (resolve, reject) => {
       try {
         const tcpSocket = connect({
@@ -561,10 +630,12 @@ async function handleTCPOutBound(
           port: port,
         });
         remoteSocket.value = tcpSocket;
-        log(`connected to ${address}:${port}`);
+        log(`Connected to ${address}:${port}`);
+        
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);
         writer.releaseLock();
+        
         resolve(tcpSocket);
       } catch (err) {
         reject(err);
@@ -584,34 +655,45 @@ async function handleTCPOutBound(
         prxIP.split(/[:=-]/)[0] || addressRemote,
         prxIP.split(/[:=-]/)[1] || portRemote
       );
-      tcpSocket.closed
-        .catch((error) => {
-          console.log("retry tcpSocket closed error", error);
-        })
-        .finally(() => {
-          safeCloseWebSocket(webSocket);
-        });
-      remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
+      
+      await remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
     } catch (err) {
       log("Retry failed", err.message);
       safeCloseWebSocket(webSocket);
+    } finally {
+      // CRITICAL FIX: Ensure socket cleanup
+      if (remoteSocket.value) {
+        try {
+          await remoteSocket.value.close();
+        } catch {}
+      }
     }
   }
 
   try {
     const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+    await remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
   } catch (err) {
     log("TCP connection failed", err.message);
-    safeCloseWebSocket(webSocket);
+    retry();
+  } finally {
+    // CRITICAL FIX: Always cleanup connection resources
+    if (remoteSocket.value) {
+      try {
+        await remoteSocket.value.close();
+      } catch {}
+    }
   }
 }
+
+// ============================================================================
+// UDP Handler with OPTIMIZED timeout
+// ============================================================================
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay) {
   try {
     let protocolHeader = responseHeader;
 
-    // CRITICAL: Add timeout for UDP relay connection
     const connectPromise = new Promise(async (resolve, reject) => {
       try {
         const tcpSocket = connect({
@@ -623,6 +705,7 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
         const headerBuffer = new TextEncoder().encode(header);
         const separator = new Uint8Array([0x7c]);
         const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
+        
         relayMessage.set(headerBuffer, 0);
         relayMessage.set(separator, headerBuffer.length);
         relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
@@ -656,41 +739,44 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
           }
         },
         close() {
-          log(`UDP connection to ${targetAddress} closed`);
+          log(`UDP connection to ${targetAddress}:${targetPort} closed`);
         },
         abort(reason) {
-          console.error(`UDP connection aborted due to ${reason}`);
+          console.error(`UDP connection aborted: ${reason}`);
         },
       })
     );
-  } catch (e) {
-    console.error(`Error while handling UDP outbound: ${e.message}`);
+  } catch (err) {
+    console.error(`UDP outbound error: ${err.message}`);
     safeCloseWebSocket(webSocket);
   }
 }
 
+// ============================================================================
+// WebSocket Stream Handler
+// ============================================================================
+
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   let readableStreamCancel = false;
+  
   const stream = new ReadableStream({
     start(controller) {
       webSocketServer.addEventListener("message", (event) => {
-        if (readableStreamCancel) {
-          return;
-        }
-        const message = event.data;
-        controller.enqueue(message);
+        if (readableStreamCancel) return;
+        controller.enqueue(event.data);
       });
+      
       webSocketServer.addEventListener("close", () => {
         safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) {
-          return;
-        }
+        if (readableStreamCancel) return;
         controller.close();
       });
+      
       webSocketServer.addEventListener("error", (err) => {
-        log("webSocketServer has error");
+        log("WebSocket error");
         controller.error(err);
       });
+      
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
       if (error) {
         controller.error(error);
@@ -700,11 +786,10 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
     },
 
     pull(controller) {},
+    
     cancel(reason) {
-      if (readableStreamCancel) {
-        return;
-      }
-      log(`ReadableStream was canceled, due to ${reason}`);
+      if (readableStreamCancel) return;
+      log(`ReadableStream canceled: ${reason}`);
       readableStreamCancel = true;
       safeCloseWebSocket(webSocketServer);
     },
@@ -713,25 +798,31 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   return stream;
 }
 
+// ============================================================================
+// Protocol Header Readers
+// ============================================================================
+
 function readSsHeader(ssBuffer) {
   const view = new DataView(ssBuffer);
-
   const addressType = view.getUint8(0);
+  
   let addressLength = 0;
   let addressValueIndex = 1;
   let addressValue = "";
 
   switch (addressType) {
-    case 1:
+    case 1: // IPv4
       addressLength = 4;
       addressValue = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
       break;
-    case 3:
-      addressLength = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+      
+    case 3: // Domain
+      addressLength = view.getUint8(addressValueIndex);
       addressValueIndex += 1;
       addressValue = new TextDecoder().decode(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
-    case 4:
+      
+    case 4: // IPv6
       addressLength = 16;
       const dataView = new DataView(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6 = [];
@@ -740,73 +831,76 @@ function readSsHeader(ssBuffer) {
       }
       addressValue = ipv6.join(":");
       break;
+      
     default:
       return {
         hasError: true,
-        message: `Invalid addressType for SS: ${addressType}`,
+        message: `Invalid SS address type: ${addressType}`,
       };
   }
 
   if (!addressValue) {
     return {
       hasError: true,
-      message: `Destination address empty, address type is: ${addressType}`,
+      message: `Empty destination address, type: ${addressType}`,
     };
   }
 
   const portIndex = addressValueIndex + addressLength;
-  const portBuffer = ssBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
+  const portRemote = new DataView(ssBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+  
   return {
     hasError: false,
     addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
+    addressType,
+    portRemote,
     rawDataIndex: portIndex + 2,
     rawClientData: ssBuffer.slice(portIndex + 2),
     version: null,
-    isUDP: portRemote == 53,
+    isUDP: portRemote === 53,
   };
 }
 
 function readFlashHeader(buffer) {
   const version = new Uint8Array(buffer.slice(0, 1));
-  let isUDP = false;
-
   const optLength = new Uint8Array(buffer.slice(17, 18))[0];
-
   const cmd = new Uint8Array(buffer.slice(18 + optLength, 18 + optLength + 1))[0];
+  
+  let isUDP = false;
   if (cmd === 1) {
+    isUDP = false;
   } else if (cmd === 2) {
     isUDP = true;
   } else {
     return {
       hasError: true,
-      message: `command ${cmd} is not supported`,
+      message: `Unsupported command: ${cmd}`,
     };
   }
+  
   const portIndex = 18 + optLength + 1;
-  const portBuffer = buffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
+  const portRemote = new DataView(buffer.slice(portIndex, portIndex + 2)).getUint16(0);
 
   let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(buffer.slice(addressIndex, addressIndex + 1));
-
-  const addressType = addressBuffer[0];
+  const addressType = new Uint8Array(buffer.slice(addressIndex, addressIndex + 1))[0];
+  
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = "";
+  
   switch (addressType) {
-    case 1:
+    case 1: // IPv4
       addressLength = 4;
       addressValue = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
       break;
-    case 2:
+      
+    case 2: // Domain
       addressLength = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + 1))[0];
       addressValueIndex += 1;
       addressValue = new TextDecoder().decode(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
-    case 3:
+      
+    case 3: // IPv6
       addressLength = 16;
       const dataView = new DataView(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6 = [];
@@ -815,64 +909,74 @@ function readFlashHeader(buffer) {
       }
       addressValue = ipv6.join(":");
       break;
+      
     default:
       return {
         hasError: true,
-        message: `invild  addressType is ${addressType}`,
+        message: `Invalid VLESS address type: ${addressType}`,
       };
   }
+  
   if (!addressValue) {
     return {
       hasError: true,
-      message: `addressValue is empty, addressType is ${addressType}`,
+      message: `Empty address, type: ${addressType}`,
     };
   }
 
   return {
     hasError: false,
     addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
+    addressType,
+    portRemote,
     rawDataIndex: addressValueIndex + addressLength,
     rawClientData: buffer.slice(addressValueIndex + addressLength),
     version: new Uint8Array([version[0], 0]),
-    isUDP: isUDP,
+    isUDP,
   };
 }
 
 function readHorseHeader(buffer) {
   const dataBuffer = buffer.slice(58);
+  
   if (dataBuffer.byteLength < 6) {
     return {
       hasError: true,
-      message: "invalid request data",
+      message: "Invalid request data",
     };
   }
 
-  let isUDP = false;
   const view = new DataView(dataBuffer);
   const cmd = view.getUint8(0);
-  if (cmd == 3) {
+  
+  let isUDP = false;
+  if (cmd === 3) {
     isUDP = true;
-  } else if (cmd != 1) {
-    throw new Error("Unsupported command type!");
+  } else if (cmd !== 1) {
+    return {
+      hasError: true,
+      message: `Unsupported command: ${cmd}`,
+    };
   }
 
-  let addressType = view.getUint8(1);
+  const addressType = view.getUint8(1);
   let addressLength = 0;
   let addressValueIndex = 2;
   let addressValue = "";
+  
   switch (addressType) {
-    case 1:
+    case 1: // IPv4
       addressLength = 4;
       addressValue = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
       break;
-    case 3:
-      addressLength = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+      
+    case 3: // Domain
+      addressLength = view.getUint8(addressValueIndex);
       addressValueIndex += 1;
       addressValue = new TextDecoder().decode(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
-    case 4:
+      
+    case 4: // IPv6
       addressLength = 16;
       const dataView = new DataView(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6 = [];
@@ -881,78 +985,81 @@ function readHorseHeader(buffer) {
       }
       addressValue = ipv6.join(":");
       break;
+      
     default:
       return {
         hasError: true,
-        message: `invalid addressType is ${addressType}`,
+        message: `Invalid Trojan address type: ${addressType}`,
       };
   }
 
   if (!addressValue) {
     return {
       hasError: true,
-      message: `address is empty, addressType is ${addressType}`,
+      message: `Empty address, type: ${addressType}`,
     };
   }
 
   const portIndex = addressValueIndex + addressLength;
-  const portBuffer = dataBuffer.slice(portIndex, portIndex + 2);
-  const portRemote = new DataView(portBuffer).getUint16(0);
+  const portRemote = new DataView(dataBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+  
   return {
     hasError: false,
     addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
+    addressType,
+    portRemote,
     rawDataIndex: portIndex + 4,
     rawClientData: dataBuffer.slice(portIndex + 4),
     version: null,
-    isUDP: isUDP,
+    isUDP,
   };
 }
+
+// ============================================================================
+// Remote Socket to WebSocket Bridge
+// ============================================================================
 
 async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log) {
   let header = responseHeader;
   let hasIncomingData = false;
-  
-  // CRITICAL: Add timeout for socket read operations
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error("Socket read timeout")), CONNECTION_TIMEOUT_MS)
-  );
 
   try {
-    await Promise.race([
-      remoteSocket.readable.pipeTo(
-        new WritableStream({
-          start() {},
-          async write(chunk, controller) {
-            hasIncomingData = true;
-            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-              controller.error("webSocket.readyState is not open, maybe close");
-            }
-            if (header) {
-              webSocket.send(await new Blob([header, chunk]).arrayBuffer());
-              header = null;
-            } else {
-              webSocket.send(chunk);
-            }
-          },
-          close() {
-            log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-          },
-          abort(reason) {
-            console.error(`remoteConnection!.readable abort`, reason);
-          },
-        })
-      ),
-      timeoutPromise,
-    ]);
+    await remoteSocket.readable.pipeTo(
+      new WritableStream({
+        start() {},
+        async write(chunk, controller) {
+          hasIncomingData = true;
+          
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            controller.error("WebSocket not open");
+            return;
+          }
+          
+          if (header) {
+            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+            header = null;
+          } else {
+            webSocket.send(chunk);
+          }
+        },
+        close() {
+          log(`Remote connection closed, hasIncomingData: ${hasIncomingData}`);
+          safeCloseWebSocket(webSocket);
+        },
+        abort(reason) {
+          console.error(`Remote connection aborted: ${reason}`);
+          safeCloseWebSocket(webSocket);
+        },
+      })
+    );
   } catch (error) {
-    console.error(`remoteSocketToWS has exception`, error.stack || error);
+    console.error(`remoteSocketToWS error:`, error.message);
     safeCloseWebSocket(webSocket);
   }
 
-  if (hasIncomingData === false && retry) {
-    log(`retry`);
+  // Only retry if no data was received and retry function exists
+  if (!hasIncomingData && retry) {
+    log(`Retrying connection`);
     retry();
   }
 }
@@ -963,7 +1070,7 @@ function safeCloseWebSocket(socket) {
       socket.close();
     }
   } catch (error) {
-    console.error("safeCloseWebSocket error", error);
+    console.error("safeCloseWebSocket error:", error);
   }
 }
 
@@ -972,11 +1079,15 @@ async function checkPrxHealth(prxIP, prxPort) {
   return await req.json();
 }
 
-// Helpers
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
 function base64ToArrayBuffer(base64Str) {
   if (!base64Str) {
     return { error: null };
   }
+  
   try {
     base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
     const decode = atob(base64Str);
@@ -988,22 +1099,27 @@ function base64ToArrayBuffer(base64Str) {
 }
 
 function arrayBufferToHex(buffer) {
-  return [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(buffer)]
+    .map((x) => x.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function shuffleArray(array) {
   let currentIndex = array.length;
-  while (currentIndex != 0) {
-    let randomIndex = Math.floor(Math.random() * currentIndex);
+  while (currentIndex !== 0) {
+    const randomIndex = Math.floor(Math.random() * currentIndex);
     currentIndex--;
     [array[currentIndex], array[randomIndex]] = [array[randomIndex], array[currentIndex]];
   }
 }
 
 function getFlagEmoji(isoCode) {
+  if (!isoCode || isoCode === "Unknown") return "🏴";
+  
   const codePoints = isoCode
     .toUpperCase()
     .split("")
     .map((char) => 127397 + char.charCodeAt(0));
+  
   return String.fromCodePoint(...codePoints);
 }
