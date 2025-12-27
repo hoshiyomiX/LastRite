@@ -26,9 +26,12 @@ const PROTOCOL_V2 = atob(v2);
 const PROTOCOL_NEKO = atob(neko);
 const UUID_V4_REGEX = /^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a-f]{12}$/i;
 
-// OPTIMIZATION 5: Pre-compute TextEncoder for UDP relay
+// Pre-compute TextEncoder for UDP relay
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
+
+// Cache flag emojis
+const FLAG_EMOJI_CACHE = new Map();
 
 const PORTS = [443, 80];
 const PROTOCOLS = [PROTOCOL_HORSE, PROTOCOL_FLASH, "ss"];
@@ -253,12 +256,13 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          const offset = parseInt(url.searchParams.get("offset")) || 0;
+          // OPTIMIZATION 9: Use unary + instead of parseInt for faster parsing
+          const offset = +url.searchParams.get("offset") || 0;
           const filterCC = url.searchParams.get("cc")?.split(",") || [];
-          const filterPort = url.searchParams.get("port")?.split(",").map(p => parseInt(p)) || PORTS;
+          const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
           const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
           const filterLimit = Math.min(
-            parseInt(url.searchParams.get("limit")) || MAX_CONFIGS_PER_REQUEST,
+            +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
             MAX_CONFIGS_PER_REQUEST
           );
           const filterFormat = url.searchParams.get("format") || "raw";
@@ -273,8 +277,9 @@ export default {
           );
 
           const uuid = crypto.randomUUID();
-          const result = [];
+          const ssUsername = btoa(`none:${uuid}`);
           
+          const result = [];
           let configCount = 0;
           
           // Create base URL once
@@ -304,7 +309,7 @@ export default {
                 baseUri.searchParams.set("path", proxyPath);
                 
                 if (protocol === "ss") {
-                  baseUri.username = btoa(`none:${uuid}`);
+                  baseUri.username = ssUsername;
                   baseUri.searchParams.set(
                     "plugin",
                     `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
@@ -315,7 +320,7 @@ export default {
                 }
 
                 baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
-                baseUri.hash = `${configCount + 1} ${getFlagEmoji(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
+                baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
                 
                 result.push(baseUri.toString());
                 configCount++;
@@ -1027,4 +1032,11 @@ function getFlagEmoji(isoCode) {
     .split("")
     .map((char) => 127397 + char.charCodeAt(0));
   return String.fromCodePoint(...codePoints);
+}
+
+function getFlagEmojiCached(isoCode) {
+  if (!FLAG_EMOJI_CACHE.has(isoCode)) {
+    FLAG_EMOJI_CACHE.set(isoCode, getFlagEmoji(isoCode));
+  }
+  return FLAG_EMOJI_CACHE.get(isoCode);
 }
