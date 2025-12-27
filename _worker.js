@@ -204,6 +204,147 @@ async function reverseWeb(request, target, targetPath) {
   return newResponse;
 }
 
+function getCacheKey(request) {
+  const url = new URL(request.url);
+  // Normalize URL for consistent cache keys
+  const params = new URLSearchParams();
+  
+  // Sort params for consistent cache keys
+  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
+  for (const key of paramKeys) {
+    const value = url.searchParams.get(key);
+    if (value) params.set(key, value);
+  }
+  
+  // Build cache key with sorted params
+  const cacheUrl = new URL(url.origin + url.pathname);
+  cacheUrl.search = params.toString();
+  
+  return new Request(cacheUrl.toString(), {
+    method: 'GET',
+    headers: request.headers,
+  });
+}
+
+async function handleCachedRequest(request, handler) {
+  // Skip cache for non-GET requests
+  if (request.method !== 'GET') {
+    return handler();
+  }
+  
+  const cache = caches.default;
+  const cacheKey = getCacheKey(request);
+  
+  // Try to get from cache
+  let response = await cache.match(cacheKey);
+  
+  if (response) {
+    // Cache hit - add header to indicate
+    const newResponse = new Response(response.body, response);
+    newResponse.headers.set('X-Cache-Status', 'HIT');
+    return newResponse;
+  }
+  
+  // Cache miss - generate response
+  response = await handler();
+  
+  // Only cache successful responses with Cache-Control header
+  if (response.status === 200 && response.headers.has('Cache-Control')) {
+    // Clone response for caching (body can only be read once)
+    const responseToCache = response.clone();
+    
+    // Add cache status header
+    const newResponse = new Response(response.body, response);
+    newResponse.headers.set('X-Cache-Status', 'MISS');
+    
+    // Store in cache (non-blocking)
+    await cache.put(cacheKey, responseToCache);
+    
+    return newResponse;
+  }
+  
+  return response;
+}
+
+// OPTIMIZATION 11: Streaming response generator
+async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername) {
+  let configCount = 0;
+  
+  // Create base URL once
+  const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
+  baseUri.searchParams.set("encryption", "none");
+  baseUri.searchParams.set("type", "ws");
+  baseUri.searchParams.set("host", APP_DOMAIN);
+  
+  for (const prx of prxList) {
+    if (configCount >= filterLimit) break;
+    
+    const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+
+    for (const port of filterPort) {
+      if (configCount >= filterLimit) break;
+      
+      const isTLS = port === 443;
+      const security = isTLS ? "tls" : "none";
+      const tlsLabel = isTLS ? "TLS" : "NTLS";
+      
+      for (const protocol of filterVPN) {
+        if (configCount >= filterLimit) break;
+
+        baseUri.protocol = protocol;
+        baseUri.port = port.toString();
+        baseUri.searchParams.set("security", security);
+        baseUri.searchParams.set("path", proxyPath);
+        
+        if (protocol === "ss") {
+          baseUri.username = ssUsername;
+          baseUri.searchParams.set(
+            "plugin",
+            `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
+          );
+        } else {
+          baseUri.username = uuid;
+          baseUri.searchParams.delete("plugin");
+        }
+
+        baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
+        baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
+        
+        // Yield each config as it's generated
+        yield baseUri.toString();
+        configCount++;
+      }
+    }
+  }
+}
+
+function createStreamingResponse(asyncGenerator, responseHeaders, filterFormat) {
+  const encoder = new TextEncoder();
+  let isFirst = true;
+  
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const config of asyncGenerator) {
+          // Add newline separator (except for first item)
+          const line = isFirst ? config : `\n${config}`;
+          isFirst = false;
+          
+          controller.enqueue(encoder.encode(line));
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+  });
+  
+  return new Response(stream, {
+    status: 200,
+    headers: responseHeaders,
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -256,105 +397,86 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          // OPTIMIZATION 9: Use unary + instead of parseInt for faster parsing
-          const offset = +url.searchParams.get("offset") || 0;
-          const filterCC = url.searchParams.get("cc")?.split(",") || [];
-          const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
-          const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
-          const filterLimit = Math.min(
-            +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
-            MAX_CONFIGS_PER_REQUEST
-          );
-          const filterFormat = url.searchParams.get("format") || "raw";
-          const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
+          return handleCachedRequest(request, async () => {
+            const offset = +url.searchParams.get("offset") || 0;
+            const filterCC = url.searchParams.get("cc")?.split(",") || [];
+            const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
+            const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
+            const filterLimit = Math.min(
+              +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
+              MAX_CONFIGS_PER_REQUEST
+            );
+            const filterFormat = url.searchParams.get("format") || "raw";
+            const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
 
-          const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
-          
-          const { data: prxList, pagination } = await getPrxListPaginated(
-            prxBankUrl,
-            { offset, limit: filterLimit, filterCC },
-            env
-          );
-
-          const uuid = crypto.randomUUID();
-          const ssUsername = btoa(`none:${uuid}`);
-          
-          const result = [];
-          let configCount = 0;
-          
-          // Create base URL once
-          const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
-          baseUri.searchParams.set("encryption", "none");
-          baseUri.searchParams.set("type", "ws");
-          baseUri.searchParams.set("host", APP_DOMAIN);
-          
-          for (const prx of prxList) {
-            if (configCount >= filterLimit) break;
+            const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
             
-            const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+            const { data: prxList, pagination } = await getPrxListPaginated(
+              prxBankUrl,
+              { offset, limit: filterLimit, filterCC },
+              env
+            );
 
-            for (const port of filterPort) {
-              if (configCount >= filterLimit) break;
-              
-              const isTLS = port === 443;
-              const security = isTLS ? "tls" : "none";
-              const tlsLabel = isTLS ? "TLS" : "NTLS";
-              
-              for (const protocol of filterVPN) {
-                if (configCount >= filterLimit) break;
+            const uuid = crypto.randomUUID();
+            const ssUsername = btoa(`none:${uuid}`);
+            
+            const responseHeaders = {
+              ...CORS_HEADER_OPTIONS,
+              "X-Pagination-Offset": offset.toString(),
+              "X-Pagination-Limit": filterLimit.toString(),
+              "X-Pagination-Total": pagination.total.toString(),
+              "X-Pagination-Has-More": pagination.hasMore.toString(),
+            };
 
-                baseUri.protocol = protocol;
-                baseUri.port = port.toString();
-                baseUri.searchParams.set("security", security);
-                baseUri.searchParams.set("path", proxyPath);
-                
-                if (protocol === "ss") {
-                  baseUri.username = ssUsername;
-                  baseUri.searchParams.set(
-                    "plugin",
-                    `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
-                  );
-                } else {
-                  baseUri.username = uuid;
-                  baseUri.searchParams.delete("plugin");
-                }
-
-                baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
-                baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
-                
-                result.push(baseUri.toString());
-                configCount++;
-              }
+            if (pagination.nextOffset !== null) {
+              responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
             }
-          }
 
-          let finalResult = "";
-          const responseHeaders = {
-            ...CORS_HEADER_OPTIONS,
-            "X-Pagination-Offset": offset.toString(),
-            "X-Pagination-Limit": filterLimit.toString(),
-            "X-Pagination-Total": pagination.total.toString(),
-            "X-Pagination-Has-More": pagination.hasMore.toString(),
-          };
-
-          if (pagination.nextOffset !== null) {
-            responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
-          }
-
-          switch (filterFormat) {
-            case "raw":
-              finalResult = result.join("\n");
+            // OPTIMIZATION 11: Use streaming for raw and v2ray formats
+            if (filterFormat === "raw") {
               responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
               responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              break;
-            case PROTOCOL_V2:
-              finalResult = btoa(result.join("\n"));
+              
+              const configStream = generateConfigsStream(
+                prxList, filterPort, filterVPN, filterLimit, 
+                fillerDomain, uuid, ssUsername
+              );
+              
+              return createStreamingResponse(configStream, responseHeaders, filterFormat);
+              
+            } else if (filterFormat === PROTOCOL_V2) {
+              // For v2ray, we need to collect all configs first (base64 encoding requirement)
+              const result = [];
+              const configStream = generateConfigsStream(
+                prxList, filterPort, filterVPN, filterLimit,
+                fillerDomain, uuid, ssUsername
+              );
+              
+              for await (const config of configStream) {
+                result.push(config);
+              }
+              
+              const finalResult = btoa(result.join("\n"));
               responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
               responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              break;
-            case PROTOCOL_NEKO:
-            case "sfa":
-            case "bfr":
+              
+              return new Response(finalResult, {
+                status: 200,
+                headers: responseHeaders,
+              });
+              
+            } else if ([PROTOCOL_NEKO, "sfa", "bfr"].includes(filterFormat)) {
+              // For converter formats, collect configs first
+              const result = [];
+              const configStream = generateConfigsStream(
+                prxList, filterPort, filterVPN, filterLimit,
+                fillerDomain, uuid, ssUsername
+              );
+              
+              for await (const config of configStream) {
+                result.push(config);
+              }
+              
               const converterPromise = fetch(CONVERTER_URL, {
                 method: "POST",
                 body: JSON.stringify({
@@ -380,11 +502,15 @@ export default {
               });
 
               if (res.status == 200) {
-                finalResult = await res.text();
-                // Preserve Content-Type from converter
+                const finalResult = await res.text();
                 const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
                 responseHeaders["Content-Type"] = contentType;
                 responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                
+                return new Response(finalResult, {
+                  status: 200,
+                  headers: responseHeaders,
+                });
               } else {
                 return new Response(res.statusText, {
                   status: res.status,
@@ -394,12 +520,7 @@ export default {
                   },
                 });
               }
-              break;
-          }
-
-          return new Response(finalResult, {
-            status: 200,
-            headers: responseHeaders,
+            }
           });
         } else if (apiPath.startsWith("/myip")) {
           return new Response(
