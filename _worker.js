@@ -204,6 +204,69 @@ async function reverseWeb(request, target, targetPath) {
   return newResponse;
 }
 
+// OPTIMIZATION 10: Cloudflare Cache API integration
+function getCacheKey(request) {
+  const url = new URL(request.url);
+  // Normalize URL for consistent cache keys
+  const params = new URLSearchParams();
+  
+  // Sort params for consistent cache keys
+  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
+  for (const key of paramKeys) {
+    const value = url.searchParams.get(key);
+    if (value) params.set(key, value);
+  }
+  
+  // Build cache key with sorted params
+  const cacheUrl = new URL(url.origin + url.pathname);
+  cacheUrl.search = params.toString();
+  
+  return new Request(cacheUrl.toString(), {
+    method: 'GET',
+    headers: request.headers,
+  });
+}
+
+async function handleCachedRequest(request, handler) {
+  // Skip cache for non-GET requests
+  if (request.method !== 'GET') {
+    return handler();
+  }
+  
+  const cache = caches.default;
+  const cacheKey = getCacheKey(request);
+  
+  // Try to get from cache
+  let response = await cache.match(cacheKey);
+  
+  if (response) {
+    // Cache hit - add header to indicate
+    const newResponse = new Response(response.body, response);
+    newResponse.headers.set('X-Cache-Status', 'HIT');
+    return newResponse;
+  }
+  
+  // Cache miss - generate response
+  response = await handler();
+  
+  // Only cache successful responses with Cache-Control header
+  if (response.status === 200 && response.headers.has('Cache-Control')) {
+    // Clone response for caching (body can only be read once)
+    const responseToCache = response.clone();
+    
+    // Add cache status header
+    const newResponse = new Response(response.body, response);
+    newResponse.headers.set('X-Cache-Status', 'MISS');
+    
+    // Store in cache (non-blocking)
+    await cache.put(cacheKey, responseToCache);
+    
+    return newResponse;
+  }
+  
+  return response;
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -256,150 +319,152 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          // OPTIMIZATION 9: Use unary + instead of parseInt for faster parsing
-          const offset = +url.searchParams.get("offset") || 0;
-          const filterCC = url.searchParams.get("cc")?.split(",") || [];
-          const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
-          const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
-          const filterLimit = Math.min(
-            +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
-            MAX_CONFIGS_PER_REQUEST
-          );
-          const filterFormat = url.searchParams.get("format") || "raw";
-          const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
+          // OPTIMIZATION 10: Wrap sub endpoint with cache handler
+          return handleCachedRequest(request, async () => {
+            const offset = +url.searchParams.get("offset") || 0;
+            const filterCC = url.searchParams.get("cc")?.split(",") || [];
+            const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
+            const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
+            const filterLimit = Math.min(
+              +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
+              MAX_CONFIGS_PER_REQUEST
+            );
+            const filterFormat = url.searchParams.get("format") || "raw";
+            const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
 
-          const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
-          
-          const { data: prxList, pagination } = await getPrxListPaginated(
-            prxBankUrl,
-            { offset, limit: filterLimit, filterCC },
-            env
-          );
-
-          const uuid = crypto.randomUUID();
-          const ssUsername = btoa(`none:${uuid}`);
-          
-          const result = [];
-          let configCount = 0;
-          
-          // Create base URL once
-          const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
-          baseUri.searchParams.set("encryption", "none");
-          baseUri.searchParams.set("type", "ws");
-          baseUri.searchParams.set("host", APP_DOMAIN);
-          
-          for (const prx of prxList) {
-            if (configCount >= filterLimit) break;
+            const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
             
-            const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+            const { data: prxList, pagination } = await getPrxListPaginated(
+              prxBankUrl,
+              { offset, limit: filterLimit, filterCC },
+              env
+            );
 
-            for (const port of filterPort) {
+            const uuid = crypto.randomUUID();
+            const ssUsername = btoa(`none:${uuid}`);
+            
+            const result = [];
+            let configCount = 0;
+            
+            // Create base URL once
+            const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
+            baseUri.searchParams.set("encryption", "none");
+            baseUri.searchParams.set("type", "ws");
+            baseUri.searchParams.set("host", APP_DOMAIN);
+            
+            for (const prx of prxList) {
               if (configCount >= filterLimit) break;
               
-              const isTLS = port === 443;
-              const security = isTLS ? "tls" : "none";
-              const tlsLabel = isTLS ? "TLS" : "NTLS";
-              
-              for (const protocol of filterVPN) {
+              const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+
+              for (const port of filterPort) {
                 if (configCount >= filterLimit) break;
-
-                baseUri.protocol = protocol;
-                baseUri.port = port.toString();
-                baseUri.searchParams.set("security", security);
-                baseUri.searchParams.set("path", proxyPath);
                 
-                if (protocol === "ss") {
-                  baseUri.username = ssUsername;
-                  baseUri.searchParams.set(
-                    "plugin",
-                    `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
-                  );
-                } else {
-                  baseUri.username = uuid;
-                  baseUri.searchParams.delete("plugin");
+                const isTLS = port === 443;
+                const security = isTLS ? "tls" : "none";
+                const tlsLabel = isTLS ? "TLS" : "NTLS";
+                
+                for (const protocol of filterVPN) {
+                  if (configCount >= filterLimit) break;
+
+                  baseUri.protocol = protocol;
+                  baseUri.port = port.toString();
+                  baseUri.searchParams.set("security", security);
+                  baseUri.searchParams.set("path", proxyPath);
+                  
+                  if (protocol === "ss") {
+                    baseUri.username = ssUsername;
+                    baseUri.searchParams.set(
+                      "plugin",
+                      `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
+                    );
+                  } else {
+                    baseUri.username = uuid;
+                    baseUri.searchParams.delete("plugin");
+                  }
+
+                  baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
+                  baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
+                  
+                  result.push(baseUri.toString());
+                  configCount++;
                 }
-
-                baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
-                baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
-                
-                result.push(baseUri.toString());
-                configCount++;
               }
             }
-          }
 
-          let finalResult = "";
-          const responseHeaders = {
-            ...CORS_HEADER_OPTIONS,
-            "X-Pagination-Offset": offset.toString(),
-            "X-Pagination-Limit": filterLimit.toString(),
-            "X-Pagination-Total": pagination.total.toString(),
-            "X-Pagination-Has-More": pagination.hasMore.toString(),
-          };
+            let finalResult = "";
+            const responseHeaders = {
+              ...CORS_HEADER_OPTIONS,
+              "X-Pagination-Offset": offset.toString(),
+              "X-Pagination-Limit": filterLimit.toString(),
+              "X-Pagination-Total": pagination.total.toString(),
+              "X-Pagination-Has-More": pagination.hasMore.toString(),
+            };
 
-          if (pagination.nextOffset !== null) {
-            responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
-          }
+            if (pagination.nextOffset !== null) {
+              responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
+            }
 
-          switch (filterFormat) {
-            case "raw":
-              finalResult = result.join("\n");
-              responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-              responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              break;
-            case PROTOCOL_V2:
-              finalResult = btoa(result.join("\n"));
-              responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-              responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              break;
-            case PROTOCOL_NEKO:
-            case "sfa":
-            case "bfr":
-              const converterPromise = fetch(CONVERTER_URL, {
-                method: "POST",
-                body: JSON.stringify({
-                  url: result.join(","),
-                  format: filterFormat,
-                  template: "cf",
-                }),
-              });
-
-              const res = await Promise.race([
-                converterPromise,
-                new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error("Converter timeout")), 8000)
-                ),
-              ]).catch(err => {
-                return new Response(JSON.stringify({ error: "Converter service timeout" }), {
-                  status: 504,
-                  headers: { 
-                    ...CORS_HEADER_OPTIONS,
-                    "Content-Type": "application/json"
-                  },
-                });
-              });
-
-              if (res.status == 200) {
-                finalResult = await res.text();
-                // Preserve Content-Type from converter
-                const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
-                responseHeaders["Content-Type"] = contentType;
+            switch (filterFormat) {
+              case "raw":
+                finalResult = result.join("\n");
+                responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
                 responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              } else {
-                return new Response(res.statusText, {
-                  status: res.status,
-                  headers: { 
-                    ...CORS_HEADER_OPTIONS,
-                    "Content-Type": "text/plain; charset=utf-8"
-                  },
+                break;
+              case PROTOCOL_V2:
+                finalResult = btoa(result.join("\n"));
+                responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
+                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                break;
+              case PROTOCOL_NEKO:
+              case "sfa":
+              case "bfr":
+                const converterPromise = fetch(CONVERTER_URL, {
+                  method: "POST",
+                  body: JSON.stringify({
+                    url: result.join(","),
+                    format: filterFormat,
+                    template: "cf",
+                  }),
                 });
-              }
-              break;
-          }
 
-          return new Response(finalResult, {
-            status: 200,
-            headers: responseHeaders,
+                const res = await Promise.race([
+                  converterPromise,
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error("Converter timeout")), 8000)
+                  ),
+                ]).catch(err => {
+                  return new Response(JSON.stringify({ error: "Converter service timeout" }), {
+                    status: 504,
+                    headers: { 
+                      ...CORS_HEADER_OPTIONS,
+                      "Content-Type": "application/json"
+                    },
+                  });
+                });
+
+                if (res.status == 200) {
+                  finalResult = await res.text();
+                  // Preserve Content-Type from converter
+                  const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
+                  responseHeaders["Content-Type"] = contentType;
+                  responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                } else {
+                  return new Response(res.statusText, {
+                    status: res.status,
+                    headers: { 
+                      ...CORS_HEADER_OPTIONS,
+                      "Content-Type": "text/plain; charset=utf-8"
+                    },
+                  });
+                }
+                break;
+            }
+
+            return new Response(finalResult, {
+              status: 200,
+              headers: responseHeaders,
+            });
           });
         } else if (apiPath.startsWith("/myip")) {
           return new Response(
