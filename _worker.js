@@ -30,7 +30,7 @@ const UUID_V4_REGEX = /^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
-// OPTIMIZATION 8: Cache flag emojis
+// Cache flag emojis
 const FLAG_EMOJI_CACHE = new Map();
 
 const PORTS = [443, 80];
@@ -256,12 +256,13 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          const offset = parseInt(url.searchParams.get("offset")) || 0;
+          // OPTIMIZATION 9: Use unary + instead of parseInt for faster parsing
+          const offset = +url.searchParams.get("offset") || 0;
           const filterCC = url.searchParams.get("cc")?.split(",") || [];
-          const filterPort = url.searchParams.get("port")?.split(",").map(p => parseInt(p)) || PORTS;
+          const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
           const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
           const filterLimit = Math.min(
-            parseInt(url.searchParams.get("limit")) || MAX_CONFIGS_PER_REQUEST,
+            +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
             MAX_CONFIGS_PER_REQUEST
           );
           const filterFormat = url.searchParams.get("format") || "raw";
@@ -1033,7 +1034,6 @@ function getFlagEmoji(isoCode) {
   return String.fromCodePoint(...codePoints);
 }
 
-// OPTIMIZATION 8: Cached flag emoji function
 function getFlagEmojiCached(isoCode) {
   if (!FLAG_EMOJI_CACHE.has(isoCode)) {
     FLAG_EMOJI_CACHE.set(isoCode, getFlagEmoji(isoCode));
