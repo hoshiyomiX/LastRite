@@ -274,7 +274,9 @@ export default {
 
           const uuid = crypto.randomUUID();
           
-          // OPTIMIZATION 6: Use array building instead of string concatenation
+          // OPTIMIZATION 7: Pre-compute base64-encoded UUID for SS protocol
+          const ssUsername = btoa(`none:${uuid}`);
+          
           const result = [];
           let configCount = 0;
           
@@ -305,7 +307,7 @@ export default {
                 baseUri.searchParams.set("path", proxyPath);
                 
                 if (protocol === "ss") {
-                  baseUri.username = btoa(`none:${uuid}`);
+                  baseUri.username = ssUsername; // Use pre-computed value
                   baseUri.searchParams.set(
                     "plugin",
                     `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
