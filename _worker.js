@@ -204,7 +204,6 @@ async function reverseWeb(request, target, targetPath) {
   return newResponse;
 }
 
-// OPTIMIZATION 10: Cloudflare Cache API integration
 function getCacheKey(request) {
   const url = new URL(request.url);
   // Normalize URL for consistent cache keys
@@ -267,6 +266,85 @@ async function handleCachedRequest(request, handler) {
   return response;
 }
 
+// OPTIMIZATION 11: Streaming response generator
+async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername) {
+  let configCount = 0;
+  
+  // Create base URL once
+  const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
+  baseUri.searchParams.set("encryption", "none");
+  baseUri.searchParams.set("type", "ws");
+  baseUri.searchParams.set("host", APP_DOMAIN);
+  
+  for (const prx of prxList) {
+    if (configCount >= filterLimit) break;
+    
+    const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+
+    for (const port of filterPort) {
+      if (configCount >= filterLimit) break;
+      
+      const isTLS = port === 443;
+      const security = isTLS ? "tls" : "none";
+      const tlsLabel = isTLS ? "TLS" : "NTLS";
+      
+      for (const protocol of filterVPN) {
+        if (configCount >= filterLimit) break;
+
+        baseUri.protocol = protocol;
+        baseUri.port = port.toString();
+        baseUri.searchParams.set("security", security);
+        baseUri.searchParams.set("path", proxyPath);
+        
+        if (protocol === "ss") {
+          baseUri.username = ssUsername;
+          baseUri.searchParams.set(
+            "plugin",
+            `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
+          );
+        } else {
+          baseUri.username = uuid;
+          baseUri.searchParams.delete("plugin");
+        }
+
+        baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
+        baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
+        
+        // Yield each config as it's generated
+        yield baseUri.toString();
+        configCount++;
+      }
+    }
+  }
+}
+
+function createStreamingResponse(asyncGenerator, responseHeaders, filterFormat) {
+  const encoder = new TextEncoder();
+  let isFirst = true;
+  
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const config of asyncGenerator) {
+          // Add newline separator (except for first item)
+          const line = isFirst ? config : `\n${config}`;
+          isFirst = false;
+          
+          controller.enqueue(encoder.encode(line));
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+  });
+  
+  return new Response(stream, {
+    status: 200,
+    headers: responseHeaders,
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -319,7 +397,6 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          // OPTIMIZATION 10: Wrap sub endpoint with cache handler
           return handleCachedRequest(request, async () => {
             const offset = +url.searchParams.get("offset") || 0;
             const filterCC = url.searchParams.get("cc")?.split(",") || [];
@@ -343,56 +420,6 @@ export default {
             const uuid = crypto.randomUUID();
             const ssUsername = btoa(`none:${uuid}`);
             
-            const result = [];
-            let configCount = 0;
-            
-            // Create base URL once
-            const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
-            baseUri.searchParams.set("encryption", "none");
-            baseUri.searchParams.set("type", "ws");
-            baseUri.searchParams.set("host", APP_DOMAIN);
-            
-            for (const prx of prxList) {
-              if (configCount >= filterLimit) break;
-              
-              const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
-
-              for (const port of filterPort) {
-                if (configCount >= filterLimit) break;
-                
-                const isTLS = port === 443;
-                const security = isTLS ? "tls" : "none";
-                const tlsLabel = isTLS ? "TLS" : "NTLS";
-                
-                for (const protocol of filterVPN) {
-                  if (configCount >= filterLimit) break;
-
-                  baseUri.protocol = protocol;
-                  baseUri.port = port.toString();
-                  baseUri.searchParams.set("security", security);
-                  baseUri.searchParams.set("path", proxyPath);
-                  
-                  if (protocol === "ss") {
-                    baseUri.username = ssUsername;
-                    baseUri.searchParams.set(
-                      "plugin",
-                      `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
-                    );
-                  } else {
-                    baseUri.username = uuid;
-                    baseUri.searchParams.delete("plugin");
-                  }
-
-                  baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
-                  baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
-                  
-                  result.push(baseUri.toString());
-                  configCount++;
-                }
-              }
-            }
-
-            let finalResult = "";
             const responseHeaders = {
               ...CORS_HEADER_OPTIONS,
               "X-Pagination-Offset": offset.toString(),
@@ -405,66 +432,95 @@ export default {
               responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
             }
 
-            switch (filterFormat) {
-              case "raw":
-                finalResult = result.join("\n");
-                responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-                break;
-              case PROTOCOL_V2:
-                finalResult = btoa(result.join("\n"));
-                responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-                break;
-              case PROTOCOL_NEKO:
-              case "sfa":
-              case "bfr":
-                const converterPromise = fetch(CONVERTER_URL, {
-                  method: "POST",
-                  body: JSON.stringify({
-                    url: result.join(","),
-                    format: filterFormat,
-                    template: "cf",
-                  }),
-                });
+            // OPTIMIZATION 11: Use streaming for raw and v2ray formats
+            if (filterFormat === "raw") {
+              responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
+              responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+              
+              const configStream = generateConfigsStream(
+                prxList, filterPort, filterVPN, filterLimit, 
+                fillerDomain, uuid, ssUsername
+              );
+              
+              return createStreamingResponse(configStream, responseHeaders, filterFormat);
+              
+            } else if (filterFormat === PROTOCOL_V2) {
+              // For v2ray, we need to collect all configs first (base64 encoding requirement)
+              const result = [];
+              const configStream = generateConfigsStream(
+                prxList, filterPort, filterVPN, filterLimit,
+                fillerDomain, uuid, ssUsername
+              );
+              
+              for await (const config of configStream) {
+                result.push(config);
+              }
+              
+              const finalResult = btoa(result.join("\n"));
+              responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
+              responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+              
+              return new Response(finalResult, {
+                status: 200,
+                headers: responseHeaders,
+              });
+              
+            } else if ([PROTOCOL_NEKO, "sfa", "bfr"].includes(filterFormat)) {
+              // For converter formats, collect configs first
+              const result = [];
+              const configStream = generateConfigsStream(
+                prxList, filterPort, filterVPN, filterLimit,
+                fillerDomain, uuid, ssUsername
+              );
+              
+              for await (const config of configStream) {
+                result.push(config);
+              }
+              
+              const converterPromise = fetch(CONVERTER_URL, {
+                method: "POST",
+                body: JSON.stringify({
+                  url: result.join(","),
+                  format: filterFormat,
+                  template: "cf",
+                }),
+              });
 
-                const res = await Promise.race([
-                  converterPromise,
-                  new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error("Converter timeout")), 8000)
-                  ),
-                ]).catch(err => {
-                  return new Response(JSON.stringify({ error: "Converter service timeout" }), {
-                    status: 504,
-                    headers: { 
-                      ...CORS_HEADER_OPTIONS,
-                      "Content-Type": "application/json"
-                    },
-                  });
+              const res = await Promise.race([
+                converterPromise,
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error("Converter timeout")), 8000)
+                ),
+              ]).catch(err => {
+                return new Response(JSON.stringify({ error: "Converter service timeout" }), {
+                  status: 504,
+                  headers: { 
+                    ...CORS_HEADER_OPTIONS,
+                    "Content-Type": "application/json"
+                  },
                 });
+              });
 
-                if (res.status == 200) {
-                  finalResult = await res.text();
-                  // Preserve Content-Type from converter
-                  const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
-                  responseHeaders["Content-Type"] = contentType;
-                  responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-                } else {
-                  return new Response(res.statusText, {
-                    status: res.status,
-                    headers: { 
-                      ...CORS_HEADER_OPTIONS,
-                      "Content-Type": "text/plain; charset=utf-8"
-                    },
-                  });
-                }
-                break;
+              if (res.status == 200) {
+                const finalResult = await res.text();
+                const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
+                responseHeaders["Content-Type"] = contentType;
+                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                
+                return new Response(finalResult, {
+                  status: 200,
+                  headers: responseHeaders,
+                });
+              } else {
+                return new Response(res.statusText, {
+                  status: res.status,
+                  headers: { 
+                    ...CORS_HEADER_OPTIONS,
+                    "Content-Type": "text/plain; charset=utf-8"
+                  },
+                });
+              }
             }
-
-            return new Response(finalResult, {
-              status: 200,
-              headers: responseHeaders,
-            });
           });
         } else if (apiPath.startsWith("/myip")) {
           return new Response(
