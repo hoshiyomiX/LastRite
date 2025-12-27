@@ -26,7 +26,7 @@ const PROTOCOL_V2 = atob(v2);
 const PROTOCOL_NEKO = atob(neko);
 const UUID_V4_REGEX = /^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a-f]{12}$/i;
 
-// OPTIMIZATION 5: Pre-compute TextEncoder for UDP relay
+// Pre-compute TextEncoder for UDP relay
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
@@ -273,8 +273,9 @@ export default {
           );
 
           const uuid = crypto.randomUUID();
-          const result = [];
           
+          // OPTIMIZATION 6: Use array building instead of string concatenation
+          const result = [];
           let configCount = 0;
           
           // Create base URL once
