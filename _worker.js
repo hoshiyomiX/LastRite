@@ -30,6 +30,9 @@ const UUID_V4_REGEX = /^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
+// OPTIMIZATION 8: Cache flag emojis
+const FLAG_EMOJI_CACHE = new Map();
+
 const PORTS = [443, 80];
 const PROTOCOLS = [PROTOCOL_HORSE, PROTOCOL_FLASH, "ss"];
 const SUB_PAGE_URL = "https://foolvpn.web.id/nautica";
@@ -273,8 +276,6 @@ export default {
           );
 
           const uuid = crypto.randomUUID();
-          
-          // OPTIMIZATION 7: Pre-compute base64-encoded UUID for SS protocol
           const ssUsername = btoa(`none:${uuid}`);
           
           const result = [];
@@ -307,7 +308,7 @@ export default {
                 baseUri.searchParams.set("path", proxyPath);
                 
                 if (protocol === "ss") {
-                  baseUri.username = ssUsername; // Use pre-computed value
+                  baseUri.username = ssUsername;
                   baseUri.searchParams.set(
                     "plugin",
                     `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${APP_DOMAIN}`
@@ -318,7 +319,7 @@ export default {
                 }
 
                 baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
-                baseUri.hash = `${configCount + 1} ${getFlagEmoji(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
+                baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
                 
                 result.push(baseUri.toString());
                 configCount++;
@@ -1030,4 +1031,12 @@ function getFlagEmoji(isoCode) {
     .split("")
     .map((char) => 127397 + char.charCodeAt(0));
   return String.fromCodePoint(...codePoints);
+}
+
+// OPTIMIZATION 8: Cached flag emoji function
+function getFlagEmojiCached(isoCode) {
+  if (!FLAG_EMOJI_CACHE.has(isoCode)) {
+    FLAG_EMOJI_CACHE.set(isoCode, getFlagEmoji(isoCode));
+  }
+  return FLAG_EMOJI_CACHE.get(isoCode);
 }
