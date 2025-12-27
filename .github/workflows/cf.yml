@@ -8,10 +8,86 @@ on:
       - testing
 
 jobs:
+  validate:
+    name: 🔍 Validate Worker Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 🥟 Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 📦 Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: 🔍 Check JavaScript syntax
+        run: |
+          echo "::group::Syntax Check"
+          node --check _worker.js
+          echo "✅ Syntax check passed"
+          echo "::endgroup::"
+
+      - name: 📋 Check file integrity
+        run: |
+          echo "::group::File Integrity Check"
+          
+          # Check if file is complete (no truncation)
+          if ! tail -1 _worker.js | grep -q '[;}]'; then
+            echo "::error::_worker.js appears truncated (missing closing bracket/semicolon)"
+            exit 1
+          fi
+          
+          # Check file size (should be > 20KB for a complete worker)
+          SIZE=$(stat -f%z _worker.js 2>/dev/null || stat -c%s _worker.js)
+          if [ "$SIZE" -lt 20000 ]; then
+            echo "::error::_worker.js file size too small ($SIZE bytes), possible truncation"
+            exit 1
+          fi
+          
+          echo "✅ File size: $SIZE bytes"
+          echo "✅ File integrity check passed"
+          echo "::endgroup::"
+
+      - name: 🔬 Lint with ESLint (optional)
+        continue-on-error: true
+        run: |
+          echo "::group::ESLint Check"
+          if [ -f ".eslintrc.json" ] || [ -f ".eslintrc.js" ]; then
+            bun run eslint _worker.js || echo "::warning::ESLint found issues (non-blocking)"
+          else
+            echo "::notice::No ESLint config found, skipping linting"
+          fi
+          echo "::endgroup::"
+
+      - name: 🧪 Wrangler dry-run (syntax + config validation)
+        run: |
+          echo "::group::Wrangler Validation"
+          bunx wrangler deploy --dry-run --outdir=./dist
+          echo "✅ Wrangler dry-run passed"
+          echo "::endgroup::"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: ✅ Validation complete
+        run: |
+          echo "::notice::✅ All validation checks passed!"
+          echo "::notice::📄 File: _worker.js"
+          echo "::notice::🌿 Branch: ${{ github.ref_name }}"
+          echo "::notice::🚀 Ready for deployment"
+
   deploy:
     name: 🚀 Deploy Worker
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: validate  # CRITICAL: Only deploy if validation passes
     
     steps:
       - name: 📥 Checkout repository
@@ -36,8 +112,46 @@ jobs:
         env:
           GIT_COMMIT_ID: ${{ github.sha }}
 
+      - name: 🧪 Post-deployment smoke test
+        continue-on-error: true  # Non-blocking
+        run: |
+          echo "::group::Smoke Test"
+          
+          # Test custom domain from wrangler.toml
+          WORKER_URL="https://hoshiyomi.qzz.io"
+          echo "🔗 Testing custom domain: $WORKER_URL"
+          
+          # Wait for deployment to propagate
+          echo "⏳ Waiting 10 seconds for deployment to propagate..."
+          sleep 10
+          
+          # Test root endpoint
+          echo "Testing root endpoint..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WORKER_URL/" --max-time 10 || echo "000")
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
+            echo "✅ Root endpoint: HTTP $HTTP_CODE"
+          else
+            echo "::warning::Root endpoint: HTTP $HTTP_CODE (may need manual verification)"
+          fi
+          
+          # Test API endpoint
+          echo "Testing API endpoint..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WORKER_URL/api/v1/myip" --max-time 10 || echo "000")
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ API endpoint: HTTP $HTTP_CODE"
+            # Show actual response
+            RESPONSE=$(curl -s "$WORKER_URL/api/v1/myip" --max-time 10 || echo "{}")
+            echo "📊 Response: $RESPONSE"
+          else
+            echo "::warning::API endpoint: HTTP $HTTP_CODE (may need manual verification)"
+          fi
+          
+          echo "::notice::💡 Smoke test completed. Verify at: $WORKER_URL"
+          echo "::endgroup::"
+
       - name: ✅ Deployment complete
         run: |
-          echo "::notice::Successfully deployed to Cloudflare Workers"
-          echo "::notice::Branch: ${{ github.ref_name }}"
-          echo "::notice::Commit: ${{ github.sha }}"
+          echo "::notice::🎉 Successfully deployed to Cloudflare Workers!"
+          echo "::notice::🌿 Branch: ${{ github.ref_name }}"
+          echo "::notice::📝 Commit: ${{ github.sha }}"
+          echo "::notice::🔗 URL: https://hoshiyomi.qzz.io"
