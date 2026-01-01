@@ -24,12 +24,13 @@ const BUFFER_HIGH_WATERMARK = 262144; // 256KB - pause if exceeded
 const BUFFER_LOW_WATERMARK = 65536;   // 64KB - resume when below
 const MAX_QUEUE_SIZE = 512;           // Max queued chunks
 
-// OPTIMIZATION 14: Adaptive timeout system
+// OPTIMIZATION 14: Adaptive timeout system (FIXED: RTT measurement)
 const latencyTracker = new Map(); // Track RTT per destination
+const connectionTimestamps = new Map(); // Track connection start times
 const LATENCY_HISTORY_SIZE = 10;  // Keep last 10 measurements
-const TIMEOUT_MIN = 8000;          // Minimum timeout: 8s
+const TIMEOUT_MIN = 12000;         // Minimum timeout: 12s (increased from 8s)
 const TIMEOUT_MAX = 45000;         // Maximum timeout: 45s
-const TIMEOUT_MULTIPLIER = 3.5;    // Timeout = RTT * multiplier
+const TIMEOUT_MULTIPLIER = 3.0;    // Timeout = RTT * multiplier (reduced from 3.5)
 const TIMEOUT_DEFAULT = 25000;     // Default when no history
 const timeoutStats = { 
   adaptive: 0, 
@@ -235,13 +236,23 @@ function cleanupTrafficPatterns() {
   }
 }
 
-// OPTIMIZATION 14: Adaptive timeout helpers
+// OPTIMIZATION 14: Adaptive timeout helpers (FIXED RTT measurement)
 function getLatencyKey(address, port) {
   return `${address}:${port}`;
 }
 
+function recordConnectionStart(address, port) {
+  const key = getLatencyKey(address, port);
+  connectionTimestamps.set(key, Date.now());
+}
+
 function recordLatency(address, port, latencyMs) {
   const key = getLatencyKey(address, port);
+  
+  // Ignore invalid measurements
+  if (latencyMs < 1 || latencyMs > 60000) {
+    return;
+  }
   
   if (!latencyTracker.has(key)) {
     latencyTracker.set(key, []);
@@ -254,6 +265,9 @@ function recordLatency(address, port, latencyMs) {
   if (history.length > LATENCY_HISTORY_SIZE) {
     history.shift();
   }
+  
+  // Cleanup connection timestamp
+  connectionTimestamps.delete(key);
 }
 
 function calculateAdaptiveTimeout(address, port, log) {
@@ -295,6 +309,14 @@ function cleanupLatencyTracker() {
     }
     
     keysToDelete.forEach(key => latencyTracker.delete(key));
+  }
+  
+  // Cleanup stale connection timestamps (older than 1 minute)
+  const now = Date.now();
+  for (const [key, timestamp] of connectionTimestamps.entries()) {
+    if (now - timestamp > 60000) {
+      connectionTimestamps.delete(key);
+    }
   }
 }
 
@@ -1007,7 +1029,7 @@ function protocolSniffer(buffer) {
   return "ss";
 }
 
-// OPTIMIZATION 14: Enhanced handleTCPOutBound with adaptive timeout
+// OPTIMIZATION 14: Enhanced handleTCPOutBound with FIXED RTT measurement
 async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
@@ -1030,9 +1052,11 @@ async function handleTCPOutBound(
       }
     }
     
-    // OPTIMIZATION 14: Calculate adaptive timeout
+    // OPTIMIZATION 14 FIX: Record connection start time
+    recordConnectionStart(address, port);
+    
+    // Calculate adaptive timeout
     const adaptiveTimeout = calculateAdaptiveTimeout(address, port, log);
-    const connectStart = Date.now();
     
     // Create new connection
     const connectPromise = new Promise(async (resolve, reject) => {
@@ -1043,20 +1067,12 @@ async function handleTCPOutBound(
         });
         remoteSocket.value = tcpSocket;
         
-        const connectTime = Date.now() - connectStart;
+        log(`TCP socket created for ${address}:${port}, waiting for first data...`);
         
-        // OPTIMIZATION 14: Record latency for future adaptive calculations
-        recordLatency(address, port, connectTime);
-        
-        if (connectTime > adaptiveTimeout * 0.8) {
-          timeoutStats.slowSuccess++;
-          log(`Slow but successful connect: ${address}:${port} (${connectTime}ms)`);
-        }
-        
-        log(`connected to ${address}:${port} in ${connectTime}ms`);
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);
         writer.releaseLock();
+        
         resolve(tcpSocket);
       } catch (err) {
         reject(err);
@@ -1420,6 +1436,7 @@ function readHorseHeader(buffer) {
 }
 
 // OPTIMIZATION 15: Enhanced remoteSocketToWS with adaptive chunk optimization
+// OPTIMIZATION 14 FIX: Record actual RTT when first data arrives
 async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
@@ -1427,6 +1444,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
   let bytesTransferred = 0;
   const bufferQueue = [];
   let isPaused = false;
+  let isFirstChunk = true; // Track first chunk for RTT measurement
   
   // OPTIMIZATION 15: Get optimal chunk size for this connection
   const optimalChunkSize = targetAddress ? getOptimalChunkSize(targetAddress, targetPort) : CHUNK_SIZE_STREAMING;
@@ -1443,6 +1461,20 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
   const processChunk = (chunk) => {
     const chunkSize = chunk.byteLength || chunk.length;
     const now = Date.now();
+    
+    // OPTIMIZATION 14 FIX: Record RTT on first chunk arrival
+    if (isFirstChunk && targetAddress && targetPort) {
+      const key = getLatencyKey(targetAddress, targetPort);
+      const connectionStart = connectionTimestamps.get(key);
+      
+      if (connectionStart) {
+        const actualRTT = now - connectionStart;
+        recordLatency(targetAddress, targetPort, actualRTT);
+        log(`Measured RTT: ${actualRTT}ms (first chunk arrival)`);
+      }
+      
+      isFirstChunk = false;
+    }
     
     // Record chunk pattern for traffic classification
     if (targetAddress) {
