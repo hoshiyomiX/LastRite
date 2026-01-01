@@ -19,6 +19,12 @@ const POOL_MAX_SIZE = 20;
 const POOL_IDLE_TIMEOUT = 60000; // 60 seconds
 const poolStats = { hits: 0, misses: 0, evictions: 0 };
 
+// OPTIMIZATION 13: Buffer management constants
+const BUFFER_HIGH_WATERMARK = 262144; // 256KB - pause if exceeded
+const BUFFER_LOW_WATERMARK = 65536;   // 64KB - resume when below
+const CHUNK_SIZE_OPTIMAL = 65536;     // 64KB per chunk
+const MAX_QUEUE_SIZE = 512;           // Max queued chunks
+
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -851,6 +857,7 @@ async function handleTCPOutBound(
   }
 }
 
+// OPTIMIZATION 13: Enhanced handleUDPOutbound with buffer management
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay) {
   try {
     let protocolHeader = responseHeader;
@@ -890,6 +897,14 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
       new WritableStream({
         async write(chunk) {
           if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            // OPTIMIZATION 13: Check buffer before sending
+            while (webSocket.bufferedAmount > BUFFER_HIGH_WATERMARK) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+              if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+                return;
+              }
+            }
+            
             if (protocolHeader) {
               webSocket.send(await new Blob([protocolHeader, chunk]).arrayBuffer());
               protocolHeader = null;
@@ -1153,15 +1168,53 @@ function readHorseHeader(buffer) {
   };
 }
 
-// OPTIMIZATION 12: Enhanced remoteSocketToWS with connection pooling
+// OPTIMIZATION 13: Enhanced remoteSocketToWS with adaptive buffer management
 async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
   let shouldReturnToPool = true;
+  let bytesTransferred = 0;
+  const bufferQueue = [];
+  let isPaused = false;
   
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error("Socket read timeout")), CONNECTION_TIMEOUT_MS)
   );
+
+  // OPTIMIZATION 13: Flush buffer queue with backpressure handling
+  const flushBuffer = async () => {
+    while (bufferQueue.length > 0 && !isPaused) {
+      if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+        bufferQueue.length = 0; // Clear queue
+        return;
+      }
+      
+      // Check for backpressure
+      if (webSocket.bufferedAmount > BUFFER_HIGH_WATERMARK) {
+        isPaused = true;
+        // Wait for buffer to drain
+        while (webSocket.bufferedAmount > BUFFER_LOW_WATERMARK) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            return;
+          }
+        }
+        isPaused = false;
+      }
+      
+      const chunk = bufferQueue.shift();
+      if (chunk) {
+        try {
+          webSocket.send(chunk);
+          bytesTransferred += chunk.byteLength || chunk.length;
+        } catch (e) {
+          log('Send error', e);
+          bufferQueue.length = 0;
+          return;
+        }
+      }
+    }
+  };
 
   try {
     await Promise.race([
@@ -1173,33 +1226,55 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
             if (webSocket.readyState !== WS_READY_STATE_OPEN) {
               controller.error("webSocket.readyState is not open, maybe close");
             }
+            
+            let dataToSend = chunk;
             if (header) {
-              webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+              dataToSend = await new Blob([header, chunk]).arrayBuffer();
               header = null;
-            } else {
-              webSocket.send(chunk);
             }
+            
+            // OPTIMIZATION 13: Queue with limit check
+            if (bufferQueue.length >= MAX_QUEUE_SIZE) {
+              log(`Queue overflow, dropping old chunks`);
+              bufferQueue.shift(); // Drop oldest
+            }
+            
+            bufferQueue.push(dataToSend);
+            await flushBuffer();
           },
           close() {
-            log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+            log(`remoteConnection closed. Transferred: ${(bytesTransferred/1024/1024).toFixed(2)}MB`);
             
-            // Return connection to pool if it's still healthy
-            if (hasIncomingData && targetAddress && targetPort && !remoteSocket.closed) {
-              returnToPool(remoteSocket, targetAddress, targetPort, log);
-              shouldReturnToPool = false;
-            }
+            // Flush remaining buffer
+            flushBuffer().then(() => {
+              // Return connection to pool if it's still healthy
+              if (hasIncomingData && targetAddress && targetPort && !remoteSocket.closed) {
+                returnToPool(remoteSocket, targetAddress, targetPort, log);
+                shouldReturnToPool = false;
+              }
+            }).catch(() => {});
           },
           abort(reason) {
-            console.error(`remoteConnection!.readable abort`, reason);
+            console.error(`remoteConnection abort`, reason);
+            bufferQueue.length = 0;
             shouldReturnToPool = false;
           },
-        })
+        }),
+        {
+          highWaterMark: 4,
+          size: chunk => chunk.byteLength || chunk.length
+        }
       ),
       timeoutPromise,
     ]);
+    
+    // Final flush
+    await flushBuffer();
+    
   } catch (error) {
-    console.error(`remoteSocketToWS has exception`, error.stack || error);
+    console.error(`remoteSocketToWS exception`, error.stack || error);
     shouldReturnToPool = false;
+    bufferQueue.length = 0;
     safeCloseWebSocket(webSocket);
   }
 
