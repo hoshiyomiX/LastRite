@@ -13,6 +13,12 @@ const inMemoryCache = {
 };
 const CACHE_TTL = 3600000; // 1 hour in milliseconds
 
+// OPTIMIZATION 12: Connection pooling
+const connectionPool = new Map();
+const POOL_MAX_SIZE = 20;
+const POOL_IDLE_TIMEOUT = 60000; // 60 seconds
+const poolStats = { hits: 0, misses: 0, evictions: 0 };
+
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -57,6 +63,80 @@ const CORS_HEADER_OPTIONS = {
 // Connection timeout constants
 const CONNECTION_TIMEOUT_MS = 25000; // 25 seconds
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+
+// OPTIMIZATION 12: Connection pool helpers
+function getPoolKey(address, port) {
+  return `${address}:${port}`;
+}
+
+async function getPooledConnection(address, port, log) {
+  const key = getPoolKey(address, port);
+  const poolEntry = connectionPool.get(key);
+  
+  if (poolEntry && !poolEntry.socket.closed) {
+    poolStats.hits++;
+    connectionPool.delete(key); // Remove from pool when taken
+    clearTimeout(poolEntry.timeoutId);
+    log(`Pool HIT: ${key} (${poolStats.hits} hits, ${poolStats.misses} misses)`);
+    return poolEntry.socket;
+  }
+  
+  if (poolEntry) {
+    // Expired or closed connection, cleanup
+    connectionPool.delete(key);
+  }
+  
+  poolStats.misses++;
+  return null;
+}
+
+function returnToPool(tcpSocket, address, port, log) {
+  // Don't pool if socket is already closed or closing
+  if (tcpSocket.closed) {
+    return;
+  }
+  
+  // Evict oldest entry if pool is full
+  if (connectionPool.size >= POOL_MAX_SIZE) {
+    const firstKey = connectionPool.keys().next().value;
+    const oldest = connectionPool.get(firstKey);
+    
+    if (oldest) {
+      clearTimeout(oldest.timeoutId);
+      try {
+        oldest.socket.close();
+      } catch (e) {
+        // Silent fail
+      }
+      connectionPool.delete(firstKey);
+      poolStats.evictions++;
+    }
+  }
+  
+  const key = getPoolKey(address, port);
+  
+  // Set idle timeout
+  const timeoutId = setTimeout(() => {
+    if (connectionPool.has(key)) {
+      const entry = connectionPool.get(key);
+      try {
+        entry.socket.close();
+      } catch (e) {
+        // Silent fail
+      }
+      connectionPool.delete(key);
+      log(`Pool cleanup: ${key} (idle timeout)`);
+    }
+  }, POOL_IDLE_TIMEOUT);
+  
+  connectionPool.set(key, {
+    socket: tcpSocket,
+    timeoutId: timeoutId,
+    timestamp: Date.now(),
+  });
+  
+  log(`Returned to pool: ${key} (pool size: ${connectionPool.size}/${POOL_MAX_SIZE})`);
+}
 
 async function getCachedData(cacheKey, fetchFn, ttl, env) {
   const now = Date.now();
@@ -693,6 +773,7 @@ function protocolSniffer(buffer) {
   return "ss";
 }
 
+// OPTIMIZATION 12: Enhanced handleTCPOutBound with connection pooling
 async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
@@ -702,7 +783,20 @@ async function handleTCPOutBound(
   responseHeader,
   log
 ) {
-  async function connectAndWrite(address, port) {
+  async function connectAndWrite(address, port, usePool = true) {
+    // Try to get pooled connection first
+    if (usePool) {
+      const pooled = await getPooledConnection(address, port, log);
+      if (pooled) {
+        remoteSocket.value = pooled;
+        const writer = pooled.writable.getWriter();
+        await writer.write(rawClientData);
+        writer.releaseLock();
+        return pooled;
+      }
+    }
+    
+    // Create new connection
     const connectPromise = new Promise(async (resolve, reject) => {
       try {
         const tcpSocket = connect({
@@ -731,7 +825,8 @@ async function handleTCPOutBound(
     try {
       const tcpSocket = await connectAndWrite(
         prxIP.split(/[:=-]/)[0] || addressRemote,
-        prxIP.split(/[:=-]/)[1] || portRemote
+        prxIP.split(/[:=-]/)[1] || portRemote,
+        false // Don't use pool on retry
       );
       tcpSocket.closed
         .catch((error) => {
@@ -749,7 +844,7 @@ async function handleTCPOutBound(
 
   try {
     const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log, addressRemote, portRemote);
   } catch (err) {
     log("TCP connection failed", err.message);
     safeCloseWebSocket(webSocket);
@@ -1058,9 +1153,11 @@ function readHorseHeader(buffer) {
   };
 }
 
-async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log) {
+// OPTIMIZATION 12: Enhanced remoteSocketToWS with connection pooling
+async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
+  let shouldReturnToPool = true;
   
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error("Socket read timeout")), CONNECTION_TIMEOUT_MS)
@@ -1085,9 +1182,16 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
           },
           close() {
             log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+            
+            // Return connection to pool if it's still healthy
+            if (hasIncomingData && targetAddress && targetPort && !remoteSocket.closed) {
+              returnToPool(remoteSocket, targetAddress, targetPort, log);
+              shouldReturnToPool = false;
+            }
           },
           abort(reason) {
             console.error(`remoteConnection!.readable abort`, reason);
+            shouldReturnToPool = false;
           },
         })
       ),
@@ -1095,7 +1199,17 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     ]);
   } catch (error) {
     console.error(`remoteSocketToWS has exception`, error.stack || error);
+    shouldReturnToPool = false;
     safeCloseWebSocket(webSocket);
+  }
+
+  // Cleanup if not pooled
+  if (shouldReturnToPool === false && remoteSocket && !remoteSocket.closed) {
+    try {
+      remoteSocket.close();
+    } catch (e) {
+      // Silent fail
+    }
   }
 
   if (hasIncomingData === false && retry) {
