@@ -39,6 +39,13 @@ const timeoutStats = {
   slowSuccess: 0 
 };
 
+// OPTIMIZATION 15 Phase 1: Adaptive watermark constants
+const WATERMARK_INTERACTIVE = 2;   // <1MB: low latency
+const WATERMARK_BALANCED = 4;      // 1-5MB: balanced (default)
+const WATERMARK_BULK = 8;          // >5MB: high throughput
+const THRESHOLD_BULK = 5242880;    // 5MB
+const THRESHOLD_MEDIUM = 1048576;  // 1MB
+
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -1267,7 +1274,8 @@ function readHorseHeader(buffer) {
   };
 }
 
-// OPTIMIZATION 13: Enhanced remoteSocketToWS with adaptive buffer management
+// OPTIMIZATION 15 Phase 1: Adaptive pipeTo watermark
+// OPTIMIZATION 13 & 14: Enhanced remoteSocketToWS with adaptive buffer management and timeout
 async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
@@ -1362,7 +1370,10 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
           },
         }),
         {
-          highWaterMark: 4,
+          // OPTIMIZATION 15 Phase 1: Adaptive watermark based on transfer size
+          highWaterMark: bytesTransferred > THRESHOLD_BULK ? WATERMARK_BULK :      // >5MB = bulk (8 chunks)
+                         bytesTransferred > THRESHOLD_MEDIUM ? WATERMARK_BALANCED : // >1MB = balanced (4 chunks) 
+                         WATERMARK_INTERACTIVE,                                      // <1MB = interactive (2 chunks)
           size: chunk => chunk.byteLength || chunk.length
         }
       ),
