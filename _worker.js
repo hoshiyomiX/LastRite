@@ -25,6 +25,20 @@ const BUFFER_LOW_WATERMARK = 65536;   // 64KB - resume when below
 const CHUNK_SIZE_OPTIMAL = 65536;     // 64KB per chunk
 const MAX_QUEUE_SIZE = 512;           // Max queued chunks
 
+// OPTIMIZATION 14: Adaptive timeout system
+const latencyTracker = new Map(); // Track RTT per destination
+const LATENCY_HISTORY_SIZE = 10;  // Keep last 10 measurements
+const TIMEOUT_MIN = 8000;          // Minimum timeout: 8s
+const TIMEOUT_MAX = 45000;         // Maximum timeout: 45s
+const TIMEOUT_MULTIPLIER = 3.5;    // Timeout = RTT * multiplier
+const TIMEOUT_DEFAULT = 25000;     // Default when no history
+const timeoutStats = { 
+  adaptive: 0, 
+  default: 0, 
+  fastFail: 0,
+  slowSuccess: 0 
+};
+
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -66,9 +80,71 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Max-Age": "86400",
 };
 
-// Connection timeout constants
-const CONNECTION_TIMEOUT_MS = 25000; // 25 seconds
+// Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+
+// OPTIMIZATION 14: Adaptive timeout helpers
+function getLatencyKey(address, port) {
+  return `${address}:${port}`;
+}
+
+function recordLatency(address, port, latencyMs) {
+  const key = getLatencyKey(address, port);
+  
+  if (!latencyTracker.has(key)) {
+    latencyTracker.set(key, []);
+  }
+  
+  const history = latencyTracker.get(key);
+  history.push(latencyMs);
+  
+  // Keep only recent history
+  if (history.length > LATENCY_HISTORY_SIZE) {
+    history.shift();
+  }
+}
+
+function calculateAdaptiveTimeout(address, port, log) {
+  const key = getLatencyKey(address, port);
+  const history = latencyTracker.get(key);
+  
+  if (!history || history.length === 0) {
+    timeoutStats.default++;
+    return TIMEOUT_DEFAULT;
+  }
+  
+  // Calculate percentile (P95) for adaptive timeout
+  const sorted = [...history].sort((a, b) => a - b);
+  const p95Index = Math.floor(sorted.length * 0.95);
+  const p95Latency = sorted[p95Index] || sorted[sorted.length - 1];
+  
+  // Calculate adaptive timeout: P95 * multiplier
+  let adaptiveTimeout = Math.floor(p95Latency * TIMEOUT_MULTIPLIER);
+  
+  // Clamp to min/max bounds
+  adaptiveTimeout = Math.max(TIMEOUT_MIN, Math.min(TIMEOUT_MAX, adaptiveTimeout));
+  
+  timeoutStats.adaptive++;
+  
+  log(`Adaptive timeout for ${key}: ${adaptiveTimeout}ms (P95 RTT: ${p95Latency}ms, samples: ${history.length})`);
+  
+  return adaptiveTimeout;
+}
+
+function cleanupLatencyTracker() {
+  // Cleanup old entries periodically (keep tracker bounded)
+  if (latencyTracker.size > 100) {
+    const keysToDelete = [];
+    let count = 0;
+    
+    for (const key of latencyTracker.keys()) {
+      if (count++ > 20) break; // Remove oldest 20 entries
+      keysToDelete.push(key);
+    }
+    
+    keysToDelete.forEach(key => latencyTracker.delete(key));
+  }
+}
 
 // OPTIMIZATION 12: Connection pool helpers
 function getPoolKey(address, port) {
@@ -779,7 +855,7 @@ function protocolSniffer(buffer) {
   return "ss";
 }
 
-// OPTIMIZATION 12: Enhanced handleTCPOutBound with connection pooling
+// OPTIMIZATION 14: Enhanced handleTCPOutBound with adaptive timeout
 async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
@@ -802,6 +878,10 @@ async function handleTCPOutBound(
       }
     }
     
+    // OPTIMIZATION 14: Calculate adaptive timeout
+    const adaptiveTimeout = calculateAdaptiveTimeout(address, port, log);
+    const connectStart = Date.now();
+    
     // Create new connection
     const connectPromise = new Promise(async (resolve, reject) => {
       try {
@@ -810,7 +890,18 @@ async function handleTCPOutBound(
           port: port,
         });
         remoteSocket.value = tcpSocket;
-        log(`connected to ${address}:${port}`);
+        
+        const connectTime = Date.now() - connectStart;
+        
+        // OPTIMIZATION 14: Record latency for future adaptive calculations
+        recordLatency(address, port, connectTime);
+        
+        if (connectTime > adaptiveTimeout * 0.8) {
+          timeoutStats.slowSuccess++;
+          log(`Slow but successful connect: ${address}:${port} (${connectTime}ms)`);
+        }
+        
+        log(`connected to ${address}:${port} in ${connectTime}ms`);
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);
         writer.releaseLock();
@@ -821,7 +912,10 @@ async function handleTCPOutBound(
     });
 
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Connection timeout")), CONNECTION_TIMEOUT_MS)
+      setTimeout(() => {
+        timeoutStats.fastFail++;
+        reject(new Error(`Connection timeout (${adaptiveTimeout}ms)`));
+      }, adaptiveTimeout)
     );
 
     return Promise.race([connectPromise, timeoutPromise]);
@@ -855,6 +949,9 @@ async function handleTCPOutBound(
     log("TCP connection failed", err.message);
     safeCloseWebSocket(webSocket);
   }
+  
+  // OPTIMIZATION 14: Periodic cleanup
+  cleanupLatencyTracker();
 }
 
 // OPTIMIZATION 13: Enhanced handleUDPOutbound with buffer management
@@ -887,8 +984,10 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
       }
     });
 
+    // OPTIMIZATION 14: Use adaptive timeout for UDP relay
+    const adaptiveTimeout = calculateAdaptiveTimeout(relay.host, relay.port, log);
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("UDP relay timeout")), CONNECTION_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`UDP relay timeout (${adaptiveTimeout}ms)`)), adaptiveTimeout)
     );
 
     const tcpSocket = await Promise.race([connectPromise, timeoutPromise]);
@@ -1177,8 +1276,10 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
   const bufferQueue = [];
   let isPaused = false;
   
+  // OPTIMIZATION 14: Use adaptive timeout for socket reads
+  const adaptiveTimeout = targetAddress ? calculateAdaptiveTimeout(targetAddress, targetPort, log) : TIMEOUT_DEFAULT;
   const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error("Socket read timeout")), CONNECTION_TIMEOUT_MS)
+    setTimeout(() => reject(new Error(`Socket read timeout (${adaptiveTimeout}ms)`)), adaptiveTimeout)
   );
 
   // OPTIMIZATION 13: Flush buffer queue with backpressure handling
