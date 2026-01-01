@@ -22,38 +22,21 @@ const poolStats = { hits: 0, misses: 0, evictions: 0 };
 // OPTIMIZATION 13: Buffer management constants
 const BUFFER_HIGH_WATERMARK = 262144; // 256KB - pause if exceeded
 const BUFFER_LOW_WATERMARK = 65536;   // 64KB - resume when below
+const CHUNK_SIZE_OPTIMAL = 65536;     // 64KB per chunk
 const MAX_QUEUE_SIZE = 512;           // Max queued chunks
 
-// OPTIMIZATION 14: Adaptive timeout system (FIXED: RTT measurement)
+// OPTIMIZATION 14: Adaptive timeout system
 const latencyTracker = new Map(); // Track RTT per destination
-const connectionTimestamps = new Map(); // Track connection start times
 const LATENCY_HISTORY_SIZE = 10;  // Keep last 10 measurements
-const TIMEOUT_MIN = 12000;         // Minimum timeout: 12s (increased from 8s)
+const TIMEOUT_MIN = 8000;          // Minimum timeout: 8s
 const TIMEOUT_MAX = 45000;         // Maximum timeout: 45s
-const TIMEOUT_MULTIPLIER = 3.0;    // Timeout = RTT * multiplier (reduced from 3.5)
+const TIMEOUT_MULTIPLIER = 3.5;    // Timeout = RTT * multiplier
 const TIMEOUT_DEFAULT = 25000;     // Default when no history
 const timeoutStats = { 
   adaptive: 0, 
   default: 0, 
   fastFail: 0,
   slowSuccess: 0 
-};
-
-// OPTIMIZATION 15: Adaptive chunk sizing
-const CHUNK_SIZE_INTERACTIVE = 8192;   // 8KB - low latency for interactive
-const CHUNK_SIZE_STREAMING = 65536;    // 64KB - balanced for streaming
-const CHUNK_SIZE_BULK = 262144;        // 256KB - high throughput for bulk
-const CHUNK_COALESCE_THRESHOLD = 4096; // 4KB - coalesce smaller chunks
-const CHUNK_SAMPLE_WINDOW = 10;        // Sample last 10 chunks for pattern
-const TRAFFIC_DETECT_THRESHOLD = 5;    // Min samples before classification
-
-const trafficPatterns = new Map(); // Track traffic patterns per connection
-const chunkStats = {
-  interactive: 0,
-  streaming: 0,
-  bulk: 0,
-  coalesced: 0,
-  totalChunks: 0
 };
 
 // Constant
@@ -100,159 +83,13 @@ const CORS_HEADER_OPTIONS = {
 // Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
 
-// OPTIMIZATION 15: Traffic pattern detection and chunk optimization
-function getTrafficKey(address, port) {
-  return `${address}:${port}`;
-}
-
-function recordChunkPattern(address, port, chunkSize, timestamp) {
-  const key = getTrafficKey(address, port);
-  
-  if (!trafficPatterns.has(key)) {
-    trafficPatterns.set(key, {
-      samples: [],
-      timestamps: [],
-      lastClassification: 'unknown',
-      createdAt: Date.now()
-    });
-  }
-  
-  const pattern = trafficPatterns.get(key);
-  pattern.samples.push(chunkSize);
-  pattern.timestamps.push(timestamp);
-  
-  // Keep only recent samples
-  if (pattern.samples.length > CHUNK_SAMPLE_WINDOW) {
-    pattern.samples.shift();
-    pattern.timestamps.shift();
-  }
-}
-
-function classifyTraffic(address, port) {
-  const key = getTrafficKey(address, port);
-  const pattern = trafficPatterns.get(key);
-  
-  if (!pattern || pattern.samples.length < TRAFFIC_DETECT_THRESHOLD) {
-    return 'streaming'; // Default to balanced mode
-  }
-  
-  const samples = pattern.samples;
-  const timestamps = pattern.timestamps;
-  
-  // Calculate statistics
-  const avgSize = samples.reduce((a, b) => a + b, 0) / samples.length;
-  const maxSize = Math.max(...samples);
-  const minSize = Math.min(...samples);
-  
-  // Calculate frequency (chunks per second)
-  const timeSpan = timestamps[timestamps.length - 1] - timestamps[0];
-  const frequency = (timestamps.length / (timeSpan / 1000)) || 0;
-  
-  // Traffic classification logic
-  let classification;
-  
-  if (avgSize < 8192 && frequency > 10) {
-    // Small chunks, high frequency = Interactive (SSH, gaming, chat)
-    classification = 'interactive';
-    chunkStats.interactive++;
-  } else if (avgSize > 131072 || (avgSize > 32768 && frequency > 5)) {
-    // Large chunks or high sustained rate = Bulk (file download, torrent)
-    classification = 'bulk';
-    chunkStats.bulk++;
-  } else {
-    // Medium chunks, consistent rate = Streaming (video, audio)
-    classification = 'streaming';
-    chunkStats.streaming++;
-  }
-  
-  pattern.lastClassification = classification;
-  return classification;
-}
-
-function getOptimalChunkSize(address, port) {
-  const trafficType = classifyTraffic(address, port);
-  
-  switch (trafficType) {
-    case 'interactive':
-      return CHUNK_SIZE_INTERACTIVE; // 8KB - minimize latency
-    case 'bulk':
-      return CHUNK_SIZE_BULK; // 256KB - maximize throughput
-    case 'streaming':
-    default:
-      return CHUNK_SIZE_STREAMING; // 64KB - balanced
-  }
-}
-
-function shouldCoalesceChunks(queuedChunks, optimalSize) {
-  if (queuedChunks.length < 2) return false;
-  
-  // Calculate total size of queued small chunks
-  let totalSize = 0;
-  let smallChunkCount = 0;
-  
-  for (const chunk of queuedChunks) {
-    const size = chunk.byteLength || chunk.length;
-    if (size < CHUNK_COALESCE_THRESHOLD) {
-      totalSize += size;
-      smallChunkCount++;
-    }
-  }
-  
-  // Coalesce if we have multiple small chunks that together are significant
-  return smallChunkCount >= 3 && totalSize >= CHUNK_COALESCE_THRESHOLD;
-}
-
-function coalesceChunks(chunks) {
-  chunkStats.coalesced++;
-  
-  // Calculate total size
-  const totalSize = chunks.reduce((sum, chunk) => {
-    return sum + (chunk.byteLength || chunk.length);
-  }, 0);
-  
-  // Create single buffer
-  const coalesced = new Uint8Array(totalSize);
-  let offset = 0;
-  
-  for (const chunk of chunks) {
-    const uint8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-    coalesced.set(uint8, offset);
-    offset += uint8.length;
-  }
-  
-  return coalesced.buffer;
-}
-
-function cleanupTrafficPatterns() {
-  const now = Date.now();
-  const MAX_PATTERN_AGE = 300000; // 5 minutes
-  
-  if (trafficPatterns.size > 100) {
-    for (const [key, pattern] of trafficPatterns.entries()) {
-      if (now - pattern.createdAt > MAX_PATTERN_AGE) {
-        trafficPatterns.delete(key);
-      }
-    }
-  }
-}
-
-// OPTIMIZATION 14: Adaptive timeout helpers (FIXED RTT measurement)
+// OPTIMIZATION 14: Adaptive timeout helpers
 function getLatencyKey(address, port) {
   return `${address}:${port}`;
 }
 
-function recordConnectionStart(address, port) {
-  const key = getLatencyKey(address, port);
-  connectionTimestamps.set(key, Date.now());
-}
-
 function recordLatency(address, port, latencyMs) {
   const key = getLatencyKey(address, port);
-  
-  // Ignore invalid measurements
-  if (latencyMs < 1 || latencyMs > 60000) {
-    return;
-  }
   
   if (!latencyTracker.has(key)) {
     latencyTracker.set(key, []);
@@ -265,9 +102,6 @@ function recordLatency(address, port, latencyMs) {
   if (history.length > LATENCY_HISTORY_SIZE) {
     history.shift();
   }
-  
-  // Cleanup connection timestamp
-  connectionTimestamps.delete(key);
 }
 
 function calculateAdaptiveTimeout(address, port, log) {
@@ -309,14 +143,6 @@ function cleanupLatencyTracker() {
     }
     
     keysToDelete.forEach(key => latencyTracker.delete(key));
-  }
-  
-  // Cleanup stale connection timestamps (older than 1 minute)
-  const now = Date.now();
-  for (const [key, timestamp] of connectionTimestamps.entries()) {
-    if (now - timestamp > 60000) {
-      connectionTimestamps.delete(key);
-    }
   }
 }
 
@@ -1029,7 +855,7 @@ function protocolSniffer(buffer) {
   return "ss";
 }
 
-// OPTIMIZATION 14: Enhanced handleTCPOutBound with FIXED RTT measurement
+// OPTIMIZATION 14: Enhanced handleTCPOutBound with adaptive timeout
 async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
@@ -1052,11 +878,9 @@ async function handleTCPOutBound(
       }
     }
     
-    // OPTIMIZATION 14 FIX: Record connection start time
-    recordConnectionStart(address, port);
-    
-    // Calculate adaptive timeout
+    // OPTIMIZATION 14: Calculate adaptive timeout
     const adaptiveTimeout = calculateAdaptiveTimeout(address, port, log);
+    const connectStart = Date.now();
     
     // Create new connection
     const connectPromise = new Promise(async (resolve, reject) => {
@@ -1067,12 +891,20 @@ async function handleTCPOutBound(
         });
         remoteSocket.value = tcpSocket;
         
-        log(`TCP socket created for ${address}:${port}, waiting for first data...`);
+        const connectTime = Date.now() - connectStart;
         
+        // OPTIMIZATION 14: Record latency for future adaptive calculations
+        recordLatency(address, port, connectTime);
+        
+        if (connectTime > adaptiveTimeout * 0.8) {
+          timeoutStats.slowSuccess++;
+          log(`Slow but successful connect: ${address}:${port} (${connectTime}ms)`);
+        }
+        
+        log(`connected to ${address}:${port} in ${connectTime}ms`);
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);
         writer.releaseLock();
-        
         resolve(tcpSocket);
       } catch (err) {
         reject(err);
@@ -1435,8 +1267,7 @@ function readHorseHeader(buffer) {
   };
 }
 
-// OPTIMIZATION 15: Enhanced remoteSocketToWS with adaptive chunk optimization
-// OPTIMIZATION 14 FIX: Record actual RTT when first data arrives
+// OPTIMIZATION 13: Enhanced remoteSocketToWS with adaptive buffer management
 async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
@@ -1444,12 +1275,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
   let bytesTransferred = 0;
   const bufferQueue = [];
   let isPaused = false;
-  let isFirstChunk = true; // Track first chunk for RTT measurement
-  
-  // OPTIMIZATION 15: Get optimal chunk size for this connection
-  const optimalChunkSize = targetAddress ? getOptimalChunkSize(targetAddress, targetPort) : CHUNK_SIZE_STREAMING;
-  const chunkCoalesceBuffer = [];
-  let lastChunkTime = Date.now();
   
   // OPTIMIZATION 14: Use adaptive timeout for socket reads
   const adaptiveTimeout = targetAddress ? calculateAdaptiveTimeout(targetAddress, targetPort, log) : TIMEOUT_DEFAULT;
@@ -1457,63 +1282,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     setTimeout(() => reject(new Error(`Socket read timeout (${adaptiveTimeout}ms)`)), adaptiveTimeout)
   );
 
-  // OPTIMIZATION 15: Smart chunk processing with coalescing
-  const processChunk = (chunk) => {
-    const chunkSize = chunk.byteLength || chunk.length;
-    const now = Date.now();
-    
-    // OPTIMIZATION 14 FIX: Record RTT on first chunk arrival
-    if (isFirstChunk && targetAddress && targetPort) {
-      const key = getLatencyKey(targetAddress, targetPort);
-      const connectionStart = connectionTimestamps.get(key);
-      
-      if (connectionStart) {
-        const actualRTT = now - connectionStart;
-        recordLatency(targetAddress, targetPort, actualRTT);
-        log(`Measured RTT: ${actualRTT}ms (first chunk arrival)`);
-      }
-      
-      isFirstChunk = false;
-    }
-    
-    // Record chunk pattern for traffic classification
-    if (targetAddress) {
-      recordChunkPattern(targetAddress, targetPort, chunkSize, now);
-    }
-    
-    chunkStats.totalChunks++;
-    
-    // Check if chunk should be coalesced
-    if (chunkSize < CHUNK_COALESCE_THRESHOLD) {
-      chunkCoalesceBuffer.push(chunk);
-      
-      // Coalesce if buffer is getting full or time elapsed
-      const bufferSize = chunkCoalesceBuffer.reduce((sum, c) => sum + (c.byteLength || c.length), 0);
-      const timeSinceLastChunk = now - lastChunkTime;
-      
-      if (bufferSize >= optimalChunkSize || timeSinceLastChunk > 50 || chunkCoalesceBuffer.length >= 10) {
-        const coalesced = coalesceChunks(chunkCoalesceBuffer);
-        chunkCoalesceBuffer.length = 0;
-        lastChunkTime = now;
-        return coalesced;
-      }
-      
-      // Don't send yet, accumulate more
-      return null;
-    }
-    
-    // Flush any pending coalesced chunks first
-    if (chunkCoalesceBuffer.length > 0) {
-      const coalesced = coalesceChunks(chunkCoalesceBuffer);
-      chunkCoalesceBuffer.length = 0;
-      bufferQueue.push(coalesced);
-    }
-    
-    lastChunkTime = now;
-    return chunk;
-  };
-
-  // OPTIMIZATION 13 & 15: Flush buffer queue with backpressure handling and adaptive chunking
+  // OPTIMIZATION 13: Flush buffer queue with backpressure handling
   const flushBuffer = async () => {
     while (bufferQueue.length > 0 && !isPaused) {
       if (webSocket.readyState !== WS_READY_STATE_OPEN) {
@@ -1552,11 +1321,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     await Promise.race([
       remoteSocket.readable.pipeTo(
         new WritableStream({
-          start() {
-            if (targetAddress) {
-              log(`Using ${optimalChunkSize / 1024}KB chunks for optimized transfer`);
-            }
-          },
+          start() {},
           async write(chunk, controller) {
             hasIncomingData = true;
             if (webSocket.readyState !== WS_READY_STATE_OPEN) {
@@ -1569,28 +1334,16 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
               header = null;
             }
             
-            // OPTIMIZATION 15: Process chunk (coalesce if needed)
-            const processed = processChunk(dataToSend);
-            
-            if (processed) {
-              // OPTIMIZATION 13: Queue with limit check
-              if (bufferQueue.length >= MAX_QUEUE_SIZE) {
-                log(`Queue overflow, dropping old chunks`);
-                bufferQueue.shift(); // Drop oldest
-              }
-              
-              bufferQueue.push(processed);
-              await flushBuffer();
+            // OPTIMIZATION 13: Queue with limit check
+            if (bufferQueue.length >= MAX_QUEUE_SIZE) {
+              log(`Queue overflow, dropping old chunks`);
+              bufferQueue.shift(); // Drop oldest
             }
+            
+            bufferQueue.push(dataToSend);
+            await flushBuffer();
           },
           close() {
-            // Flush any remaining coalesced chunks
-            if (chunkCoalesceBuffer.length > 0) {
-              const coalesced = coalesceChunks(chunkCoalesceBuffer);
-              bufferQueue.push(coalesced);
-              chunkCoalesceBuffer.length = 0;
-            }
-            
             log(`remoteConnection closed. Transferred: ${(bytesTransferred/1024/1024).toFixed(2)}MB`);
             
             // Flush remaining buffer
@@ -1605,7 +1358,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
           abort(reason) {
             console.error(`remoteConnection abort`, reason);
             bufferQueue.length = 0;
-            chunkCoalesceBuffer.length = 0;
             shouldReturnToPool = false;
           },
         }),
@@ -1624,7 +1376,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     console.error(`remoteSocketToWS exception`, error.stack || error);
     shouldReturnToPool = false;
     bufferQueue.length = 0;
-    chunkCoalesceBuffer.length = 0;
     safeCloseWebSocket(webSocket);
   }
 
@@ -1641,9 +1392,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     log(`retry`);
     retry();
   }
-  
-  // OPTIMIZATION 15: Periodic cleanup
-  cleanupTrafficPatterns();
 }
 
 function safeCloseWebSocket(socket) {
