@@ -1,12 +1,28 @@
 name: Performance Monitoring & Statistics Collector
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - '_worker.js'
+      - '.github/workflows/benchmark-monitor.yml'
+  
   schedule:
     # Run every 30 minutes (more sustainable than 15min)
     - cron: '*/30 * * * *'
   
   workflow_dispatch:
     inputs:
+      target_branch:
+        description: 'Branch to test'
+        required: true
+        default: 'main'
+        type: choice
+        options:
+          - main
+          - testing
+          - checkpoint
       test_mode:
         description: 'Test mode (quick, standard, extensive)'
         required: false
@@ -53,9 +69,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: ${{ github.event.inputs.target_branch || github.head_ref || github.ref_name }}
           fetch-depth: 50  # For historical comparison
           token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Display selected branch
+        run: |
+          echo "📍 Testing branch: ${{ github.event.inputs.target_branch || github.head_ref || github.ref_name }}"
+          echo "📊 Test mode: ${{ github.event.inputs.test_mode || 'standard' }}"
+          echo "🎯 Scenarios: ${{ github.event.inputs.scenarios || 'light,normal,burst' }}"
+          git branch --show-current
+          git log -1 --oneline
       
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
@@ -956,6 +980,7 @@ All metrics are within acceptable thresholds. System is operating optimally.
             git commit -m "chore(monitoring): performance metrics ${{ env.METRICS_TIMESTAMP }}
 
 📊 Performance Summary:
+- Branch: ${{ github.event.inputs.target_branch || github.ref_name }}
 - Status: ${{ steps.analyze.outputs.health_status }}
 - P95 Latency: ${{ steps.analyze.outputs.p95_latency }}ms
 - Throughput: ${{ steps.analyze.outputs.avg_rps }} RPS
