@@ -51,6 +51,18 @@ const COALESCE_THRESHOLD = 16384;  // 16KB - batch chunks smaller than this
 const COALESCE_MAX_SIZE = 131072;  // 128KB - max batched size
 const COALESCE_TIMEOUT = 5;        // 5ms - max wait for batching
 
+// OPTIMIZATION 16: Smart retry with exponential backoff
+const RETRY_MAX_ATTEMPTS = 3;      // Max retry attempts
+const RETRY_BASE_DELAY = 1000;     // 1s base delay
+const RETRY_MAX_DELAY = 8000;      // 8s max delay
+const RETRY_JITTER_FACTOR = 0.3;   // 30% jitter
+const retryStats = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  totalDelay: 0
+};
+
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -94,6 +106,25 @@ const CORS_HEADER_OPTIONS = {
 
 // Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+
+// OPTIMIZATION 16: Retry helper functions
+function calculateBackoff(attempt) {
+  // Exponential backoff: base * 2^attempt, capped at max
+  const exponentialDelay = Math.min(
+    RETRY_BASE_DELAY * Math.pow(2, attempt),
+    RETRY_MAX_DELAY
+  );
+  
+  // Add jitter: ±30% randomization to prevent thundering herd
+  const jitter = exponentialDelay * RETRY_JITTER_FACTOR * (Math.random() * 2 - 1);
+  const totalDelay = Math.max(0, exponentialDelay + jitter);
+  
+  return Math.floor(totalDelay);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 // OPTIMIZATION 14: Adaptive timeout helpers
 function getLatencyKey(address, port) {
@@ -867,7 +898,7 @@ function protocolSniffer(buffer) {
   return "ss";
 }
 
-// OPTIMIZATION 14: Enhanced handleTCPOutBound with adaptive timeout
+// OPTIMIZATION 14 & 16: Enhanced handleTCPOutBound with adaptive timeout and smart retry
 async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
@@ -933,13 +964,35 @@ async function handleTCPOutBound(
     return Promise.race([connectPromise, timeoutPromise]);
   }
 
-  async function retry() {
+  // OPTIMIZATION 16: Smart retry with exponential backoff
+  async function retryWithBackoff(attempt = 0) {
+    if (attempt >= RETRY_MAX_ATTEMPTS) {
+      retryStats.failures++;
+      log(`Max retry attempts (${RETRY_MAX_ATTEMPTS}) exceeded`);
+      safeCloseWebSocket(webSocket);
+      return;
+    }
+    
+    // Calculate backoff delay
+    const delay = calculateBackoff(attempt);
+    retryStats.attempts++;
+    retryStats.totalDelay += delay;
+    
+    log(`Retry attempt ${attempt + 1}/${RETRY_MAX_ATTEMPTS} after ${delay}ms backoff`);
+    
+    // Wait with exponential backoff + jitter
+    await sleep(delay);
+    
     try {
       const tcpSocket = await connectAndWrite(
         prxIP.split(/[:=-]/)[0] || addressRemote,
         prxIP.split(/[:=-]/)[1] || portRemote,
         false // Don't use pool on retry
       );
+      
+      retryStats.successes++;
+      log(`Retry succeeded on attempt ${attempt + 1}`);
+      
       tcpSocket.closed
         .catch((error) => {
           console.log("retry tcpSocket closed error", error);
@@ -949,17 +1002,19 @@ async function handleTCPOutBound(
         });
       remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
     } catch (err) {
-      log("Retry failed", err.message);
-      safeCloseWebSocket(webSocket);
+      log(`Retry attempt ${attempt + 1} failed:`, err.message);
+      // Recursive retry with incremented attempt
+      await retryWithBackoff(attempt + 1);
     }
   }
 
   try {
     const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log, addressRemote, portRemote);
+    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retryWithBackoff, log, addressRemote, portRemote);
   } catch (err) {
     log("TCP connection failed", err.message);
-    safeCloseWebSocket(webSocket);
+    // Start retry sequence
+    await retryWithBackoff(0);
   }
   
   // OPTIMIZATION 14: Periodic cleanup
