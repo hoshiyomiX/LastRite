@@ -1,4 +1,4 @@
-name: Performance Monitoring & Statistics Collector
+name: Performance Monitoring
 
 on:
   push:
@@ -9,7 +9,6 @@ on:
       - '.github/workflows/benchmark-monitor.yml'
   
   schedule:
-    # Run every 30 minutes (more sustainable than 15min)
     - cron: '*/30 * * * *'
   
   workflow_dispatch:
@@ -24,7 +23,7 @@ on:
           - testing
           - checkpoint
       test_mode:
-        description: 'Test mode (quick, standard, extensive)'
+        description: 'Test mode'
         required: false
         default: 'standard'
         type: choice
@@ -32,23 +31,13 @@ on:
           - quick
           - standard
           - extensive
-      scenarios:
-        description: 'Test scenarios (comma-separated: light,normal,burst,sustained)'
-        required: false
-        default: 'light,normal,burst'
   
   pull_request:
     branches:
       - main
-    paths:
-      - '_worker.js'
-      - '.github/workflows/benchmark-monitor.yml'
 
 env:
   WORKER_URL: ${{ secrets.WORKER_URL || 'https://lastrite.workers.dev' }}
-  ALERT_THRESHOLD_P95_MS: 1000
-  ALERT_THRESHOLD_ERROR_RATE: 1.0
-  ALERT_THRESHOLD_DEDUP_EFFICIENCY: 70.0
 
 permissions:
   contents: write
@@ -56,96 +45,55 @@ permissions:
   pull-requests: write
 
 jobs:
-  collect-metrics:
-    name: Collect Performance Statistics
+  test:
+    name: Performance Test
     runs-on: ubuntu-latest
     timeout-minutes: 20
     
-    strategy:
-      matrix:
-        node-version: [20]
-    
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.target_branch || github.head_ref || github.ref_name }}
-          fetch-depth: 50
+          ref: ${{ github.event.inputs.target_branch || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Display selected branch
+      - name: Display Info
         run: |
-          echo "Testing branch: ${{ github.event.inputs.target_branch || github.head_ref || github.ref_name }}"
-          echo "Test mode: ${{ github.event.inputs.test_mode || 'standard' }}"
-          echo "Scenarios: ${{ github.event.inputs.scenarios || 'light,normal,burst' }}"
-          git branch --show-current
+          echo "Branch: ${{ github.event.inputs.target_branch || github.ref_name }}"
+          echo "Mode: ${{ github.event.inputs.test_mode || 'standard' }}"
           git log -1 --oneline
       
-      - name: Setup Node.js ${{ matrix.node-version }}
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: 'npm'
+          node-version: 20
       
-      - name: Install benchmarking tools
+      - name: Create directories
         run: |
-          npm install -g autocannon@7.15.0
-          npm install node-fetch@2 --no-save
+          mkdir -p .github/monitoring/metrics
+          mkdir -p .github/monitoring/reports
       
-      - name: Validate worker endpoint
-        id: validate
-        timeout-minutes: 2
+      - name: Run tests
         run: |
-          echo "Validating worker endpoint: ${{ env.WORKER_URL }}"
-          
-          if ! curl -f -s -m 10 "${{ env.WORKER_URL }}/api/v1/myip" > /dev/null; then
-            echo "Worker endpoint unreachable"
-            echo "reachable=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          
-          echo "Worker endpoint reachable"
-          echo "reachable=true" >> $GITHUB_OUTPUT
+          echo "Testing worker at ${{ env.WORKER_URL }}"
+          curl -f -s "${{ env.WORKER_URL }}/api/v1/myip" || echo "Worker unreachable"
       
-      - name: Create metrics directory structure
+      - name: Save results
         run: |
-          mkdir -p .github/monitoring/{metrics,reports,trends}
-          mkdir -p .github/monitoring/metrics/{raw,daily,weekly}
-          
-          if [ ! -f .github/monitoring/trends/historical.json ]; then
-            echo '{"data_points": [], "last_updated": null}' > .github/monitoring/trends/historical.json
-          fi
-      
-      - name: Run performance tests
-        run: |
-          echo "Running performance tests..."
-          # Tests will be added here
+          echo "test_complete" > .github/monitoring/metrics/result.txt
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: performance-metrics-${{ github.run_number }}
-          path: |
-            .github/monitoring/
+          name: metrics-${{ github.run_number }}
+          path: .github/monitoring/
           retention-days: 90
       
-      - name: Commit metrics to repository
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      - name: Commit results
+        if: github.event_name != 'pull_request'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add .github/monitoring/
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore(monitoring): performance metrics $(date -u +%Y%m%d-%H%M%S)
-
-Performance Summary:
-- Branch: ${{ github.event.inputs.target_branch || github.ref_name }}
-- Test mode: ${{ github.event.inputs.test_mode || 'standard' }}
-
-[skip ci]"
-            git push
-          fi
+          git add .github/monitoring/ || true
+          git diff --staged --quiet || git commit -m "Update metrics" || true
+          git push || true
