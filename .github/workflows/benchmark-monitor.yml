@@ -1,0 +1,1031 @@
+name: Performance Monitoring & Statistics Collector
+
+on:
+  schedule:
+    # Run every 30 minutes (more sustainable than 15min)
+    - cron: '*/30 * * * *'
+  
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode (quick, standard, extensive)'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - quick
+          - standard
+          - extensive
+      scenarios:
+        description: 'Test scenarios (comma-separated: light,normal,burst,sustained)'
+        required: false
+        default: 'light,normal,burst'
+  
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '_worker.js'
+      - '.github/workflows/benchmark-monitor.yml'
+
+env:
+  WORKER_URL: ${{ secrets.WORKER_URL || 'https://lastrite.workers.dev' }}
+  ALERT_THRESHOLD_P95_MS: 1000
+  ALERT_THRESHOLD_ERROR_RATE: 1.0
+  ALERT_THRESHOLD_DEDUP_EFFICIENCY: 70.0
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  collect-metrics:
+    name: Collect Performance Statistics
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    strategy:
+      matrix:
+        node-version: [20]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 50  # For historical comparison
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      
+      - name: Install benchmarking tools
+        run: |
+          npm install -g autocannon@7.15.0
+          npm install node-fetch@2 --no-save
+      
+      - name: Validate worker endpoint
+        id: validate
+        timeout-minutes: 2
+        run: |
+          echo "Validating worker endpoint: ${{ env.WORKER_URL }}"
+          
+          if ! curl -f -s -m 10 "${{ env.WORKER_URL }}/api/v1/myip" > /dev/null; then
+            echo "❌ Worker endpoint unreachable"
+            echo "reachable=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "✅ Worker endpoint reachable"
+          echo "reachable=true" >> $GITHUB_OUTPUT
+      
+      - name: Create metrics directory structure
+        run: |
+          mkdir -p .github/monitoring/{metrics,reports,trends}
+          mkdir -p .github/monitoring/metrics/{raw,daily,weekly}
+          
+          # Initialize trend file if not exists
+          if [ ! -f .github/monitoring/trends/historical.json ]; then
+            echo '{"data_points": [], "last_updated": null}' > .github/monitoring/trends/historical.json
+          fi
+      
+      - name: Scenario 1 - Light Load Test
+        id: scenario_light
+        if: contains(github.event.inputs.scenarios, 'light') || github.event.inputs.scenarios == ''
+        timeout-minutes: 3
+        run: |
+          echo "🔹 Scenario 1: Light Load (10 concurrent, 30s)"
+          
+          autocannon \
+            --connections 10 \
+            --duration 30 \
+            --json \
+            --timeout 15 \
+            "${{ env.WORKER_URL }}/api/v1/sub?cc=US&limit=10" \
+            > scenario-light.json
+          
+          echo "✅ Light load scenario completed"
+          jq '.title = "light" | .scenario = "10_concurrent_30s"' scenario-light.json > tmp.json && mv tmp.json scenario-light.json
+      
+      - name: Scenario 2 - Normal Load Test
+        id: scenario_normal
+        if: contains(github.event.inputs.scenarios, 'normal') || github.event.inputs.scenarios == ''
+        timeout-minutes: 4
+        run: |
+          echo "🔹 Scenario 2: Normal Load (50 concurrent, 60s)"
+          
+          autocannon \
+            --connections 50 \
+            --duration 60 \
+            --json \
+            --timeout 15 \
+            "${{ env.WORKER_URL }}/api/v1/sub?cc=US,SG&limit=20" \
+            > scenario-normal.json
+          
+          echo "✅ Normal load scenario completed"
+          jq '.title = "normal" | .scenario = "50_concurrent_60s"' scenario-normal.json > tmp.json && mv tmp.json scenario-normal.json
+      
+      - name: Scenario 3 - Burst Traffic Test
+        id: scenario_burst
+        if: contains(github.event.inputs.scenarios, 'burst') || github.event.inputs.scenarios == ''
+        timeout-minutes: 3
+        run: |
+          echo "🔹 Scenario 3: Burst Traffic (100 concurrent, 30s)"
+          
+          autocannon \
+            --connections 100 \
+            --duration 30 \
+            --json \
+            --timeout 15 \
+            "${{ env.WORKER_URL }}/api/v1/sub?cc=US&limit=15" \
+            > scenario-burst.json
+          
+          echo "✅ Burst traffic scenario completed"
+          jq '.title = "burst" | .scenario = "100_concurrent_30s"' scenario-burst.json > tmp.json && mv tmp.json scenario-burst.json
+      
+      - name: Scenario 4 - Sustained High Load Test
+        id: scenario_sustained
+        if: contains(github.event.inputs.scenarios, 'sustained')
+        timeout-minutes: 6
+        run: |
+          echo "🔹 Scenario 4: Sustained High Load (75 concurrent, 120s)"
+          
+          autocannon \
+            --connections 75 \
+            --duration 120 \
+            --json \
+            --timeout 20 \
+            "${{ env.WORKER_URL }}/api/v1/sub?cc=SG,US,JP&limit=20" \
+            > scenario-sustained.json
+          
+          echo "✅ Sustained load scenario completed"
+          jq '.title = "sustained" | .scenario = "75_concurrent_120s"' scenario-sustained.json > tmp.json && mv tmp.json scenario-sustained.json
+      
+      - name: Test Opt-17 Deduplication Efficiency
+        id: test_dedup
+        timeout-minutes: 3
+        run: |
+          node << 'EOF'
+          const fetch = require('node-fetch');
+          const { performance } = require('perf_hooks');
+          
+          async function testDeduplication() {
+            const url = '${{ env.WORKER_URL }}/api/v1/sub?cc=US&limit=20';
+            const tests = [
+              { name: 'sequential', concurrency: 1, iterations: 20 },
+              { name: 'low_concurrent', concurrency: 25, iterations: 1 },
+              { name: 'high_concurrent', concurrency: 100, iterations: 1 },
+              { name: 'burst_pattern', concurrency: 50, iterations: 2 }
+            ];
+            
+            const results = [];
+            
+            for (const test of tests) {
+              console.log(`\nTesting deduplication: ${test.name}`);
+              
+              for (let iter = 0; iter < test.iterations; iter++) {
+                const start = performance.now();
+                
+                const promises = Array(test.concurrency).fill(null).map(async () => {
+                  try {
+                    const response = await fetch(url, { timeout: 15000 });
+                    return {
+                      status: response.status,
+                      ok: response.ok,
+                      dedupStats: response.headers.get('x-dedup-stats'),
+                      cacheStatus: response.headers.get('x-cache-status'),
+                      latency: performance.now() - start
+                    };
+                  } catch (err) {
+                    return { error: err.message, status: 0 };
+                  }
+                });
+                
+                const responses = await Promise.all(promises);
+                const duration = performance.now() - start;
+                
+                // Parse stats from successful response
+                const successfulResponse = responses.find(r => r.dedupStats);
+                const dedupMatch = successfulResponse?.dedupStats?.match(/hits=(\d+) misses=(\d+) saved=(\d+)/);
+                
+                const successCount = responses.filter(r => r.ok).length;
+                const errorCount = responses.filter(r => r.error || !r.ok).length;
+                const cacheHits = responses.filter(r => r.cacheStatus === 'HIT').length;
+                
+                results.push({
+                  test_name: test.name,
+                  iteration: iter + 1,
+                  concurrency: test.concurrency,
+                  duration_ms: Math.round(duration),
+                  avg_latency_ms: Math.round(duration / test.concurrency),
+                  success_count: successCount,
+                  error_count: errorCount,
+                  success_rate: ((successCount / test.concurrency) * 100).toFixed(2),
+                  dedup_hits: dedupMatch ? parseInt(dedupMatch[1]) : 0,
+                  dedup_misses: dedupMatch ? parseInt(dedupMatch[2]) : 0,
+                  dedup_saved: dedupMatch ? parseInt(dedupMatch[3]) : 0,
+                  dedup_efficiency: dedupMatch ? ((parseInt(dedupMatch[1]) / (parseInt(dedupMatch[1]) + parseInt(dedupMatch[2]))) * 100).toFixed(2) : '0.00',
+                  cache_hits: cacheHits,
+                  cache_misses: test.concurrency - cacheHits,
+                  cache_hit_rate: ((cacheHits / test.concurrency) * 100).toFixed(2)
+                });
+                
+                // Small delay between iterations
+                if (iter < test.iterations - 1) {
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+              }
+            }
+            
+            const summary = {
+              timestamp: new Date().toISOString(),
+              test_count: results.length,
+              total_requests: results.reduce((sum, r) => sum + r.concurrency, 0),
+              avg_dedup_efficiency: (results.reduce((sum, r) => sum + parseFloat(r.dedup_efficiency), 0) / results.length).toFixed(2),
+              avg_cache_hit_rate: (results.reduce((sum, r) => sum + parseFloat(r.cache_hit_rate), 0) / results.length).toFixed(2),
+              overall_success_rate: (results.reduce((sum, r) => sum + parseFloat(r.success_rate), 0) / results.length).toFixed(2),
+              tests: results
+            };
+            
+            console.log('\n📊 Deduplication Test Summary:');
+            console.log(JSON.stringify(summary, null, 2));
+            
+            require('fs').writeFileSync('dedup-test-results.json', JSON.stringify(summary, null, 2));
+          }
+          
+          testDeduplication().catch(err => {
+            console.error('Deduplication test failed:', err);
+            process.exit(1);
+          });
+          EOF
+      
+      - name: Test Optimization Stack (Opt-11 to Opt-17)
+        id: test_optimizations
+        timeout-minutes: 3
+        run: |
+          node << 'EOF'
+          const fetch = require('node-fetch');
+          
+          async function testOptimizationStack() {
+            const baseUrl = '${{ env.WORKER_URL }}';
+            
+            const tests = [
+              {
+                name: 'Opt-11: Streaming (raw format)',
+                url: '/api/v1/sub?cc=US&limit=20&format=raw',
+                expects: { streaming: true, format: 'text/plain' }
+              },
+              {
+                name: 'Opt-11: Streaming (v2ray base64)',
+                url: '/api/v1/sub?cc=SG&limit=15&format=v2ray',
+                expects: { streaming: false, format: 'text/plain' }
+              },
+              {
+                name: 'Opt-12: Connection Pool (multiple requests)',
+                url: '/api/v1/sub?cc=JP&limit=10',
+                concurrent: 5,
+                expects: { pool_reuse: true }
+              },
+              {
+                name: 'Opt-17: Request Deduplication',
+                url: '/api/v1/sub?cc=US&limit=20',
+                concurrent: 50,
+                expects: { dedup_efficiency: 70 }
+              }
+            ];
+            
+            const results = [];
+            
+            for (const test of tests) {
+              console.log(`\nTesting: ${test.name}`);
+              
+              const concurrent = test.concurrent || 1;
+              const start = Date.now();
+              
+              try {
+                const promises = Array(concurrent).fill(null).map(async () => {
+                  const response = await fetch(baseUrl + test.url, { timeout: 15000 });
+                  const headers = {};
+                  response.headers.forEach((value, key) => {
+                    if (key.startsWith('x-') || key === 'content-type' || key === 'cache-control') {
+                      headers[key] = value;
+                    }
+                  });
+                  
+                  return {
+                    status: response.status,
+                    ok: response.ok,
+                    headers,
+                    size: parseInt(response.headers.get('content-length') || '0')
+                  };
+                });
+                
+                const responses = await Promise.all(promises);
+                const duration = Date.now() - start;
+                
+                const firstResponse = responses[0];
+                const allSuccess = responses.every(r => r.ok);
+                
+                // Extract optimization metrics
+                const dedupStats = firstResponse.headers['x-dedup-stats'];
+                const cacheStatus = firstResponse.headers['x-cache-status'];
+                const paginationTotal = firstResponse.headers['x-pagination-total'];
+                
+                results.push({
+                  optimization: test.name,
+                  url: test.url,
+                  concurrent_requests: concurrent,
+                  duration_ms: duration,
+                  avg_latency_ms: Math.round(duration / concurrent),
+                  success_rate: allSuccess ? 100 : 0,
+                  content_type: firstResponse.headers['content-type'],
+                  cache_status: cacheStatus,
+                  dedup_stats: dedupStats,
+                  response_size: firstResponse.size,
+                  validation: {
+                    passed: allSuccess,
+                    expected: test.expects,
+                    actual: {
+                      format: firstResponse.headers['content-type'],
+                      dedup_efficiency: dedupStats ? parseFloat(dedupStats.match(/hits=\d+ misses=\d+ saved=(\d+)/)?.[1] || '0') : null
+                    }
+                  }
+                });
+              } catch (err) {
+                results.push({
+                  optimization: test.name,
+                  url: test.url,
+                  error: err.message,
+                  validation: { passed: false }
+                });
+              }
+            }
+            
+            const summary = {
+              timestamp: new Date().toISOString(),
+              tests_run: results.length,
+              tests_passed: results.filter(r => r.validation.passed).length,
+              tests_failed: results.filter(r => !r.validation.passed).length,
+              results
+            };
+            
+            console.log('\n🔧 Optimization Stack Test Summary:');
+            console.log(JSON.stringify(summary, null, 2));
+            
+            require('fs').writeFileSync('optimization-test-results.json', JSON.stringify(summary, null, 2));
+          }
+          
+          testOptimizationStack().catch(err => {
+            console.error('Optimization test failed:', err);
+            process.exit(1);
+          });
+          EOF
+      
+      - name: Endpoint Health Check
+        id: health_check
+        timeout-minutes: 2
+        run: |
+          node << 'EOF'
+          const fetch = require('node-fetch');
+          
+          async function healthCheck() {
+            const baseUrl = '${{ env.WORKER_URL }}';
+            const endpoints = [
+              { name: 'myip', url: '/api/v1/myip', critical: true },
+              { name: 'sub_default', url: '/api/v1/sub?limit=5', critical: true },
+              { name: 'sub_filtered', url: '/api/v1/sub?cc=US&limit=10', critical: true },
+              { name: 'sub_v2ray', url: '/api/v1/sub?cc=SG&limit=5&format=v2ray', critical: false },
+              { name: 'health_check', url: '/check?target=1.1.1.1:443', critical: false }
+            ];
+            
+            const results = [];
+            
+            for (const endpoint of endpoints) {
+              const start = Date.now();
+              
+              try {
+                const response = await fetch(baseUrl + endpoint.url, { 
+                  timeout: 10000,
+                  headers: { 'User-Agent': 'GitHub-Actions-Monitor/1.0' }
+                });
+                
+                const duration = Date.now() - start;
+                const body = await response.text();
+                
+                results.push({
+                  name: endpoint.name,
+                  url: endpoint.url,
+                  critical: endpoint.critical,
+                  status: response.status,
+                  ok: response.ok,
+                  latency_ms: duration,
+                  response_size: body.length,
+                  cache_status: response.headers.get('x-cache-status'),
+                  dedup_stats: response.headers.get('x-dedup-stats'),
+                  health: response.ok ? 'healthy' : 'unhealthy'
+                });
+              } catch (err) {
+                results.push({
+                  name: endpoint.name,
+                  url: endpoint.url,
+                  critical: endpoint.critical,
+                  error: err.message,
+                  health: 'error'
+                });
+              }
+            }
+            
+            const summary = {
+              timestamp: new Date().toISOString(),
+              total_endpoints: results.length,
+              healthy: results.filter(r => r.health === 'healthy').length,
+              unhealthy: results.filter(r => r.health === 'unhealthy').length,
+              errors: results.filter(r => r.health === 'error').length,
+              critical_failures: results.filter(r => r.critical && r.health !== 'healthy').length,
+              avg_latency_ms: Math.round(results.filter(r => r.latency_ms).reduce((sum, r) => sum + r.latency_ms, 0) / results.filter(r => r.latency_ms).length),
+              endpoints: results
+            };
+            
+            console.log('\n💊 Health Check Summary:');
+            console.log(JSON.stringify(summary, null, 2));
+            
+            require('fs').writeFileSync('health-check-results.json', JSON.stringify(summary, null, 2));
+            
+            // Fail if critical endpoints are down
+            if (summary.critical_failures > 0) {
+              console.error('\n❌ Critical endpoints are failing!');
+              process.exit(1);
+            }
+          }
+          
+          healthCheck().catch(err => {
+            console.error('Health check failed:', err);
+            process.exit(1);
+          });
+          EOF
+      
+      - name: Combine & Analyze Metrics
+        id: analyze
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          
+          function loadJSON(filename) {
+            try {
+              return JSON.parse(fs.readFileSync(filename, 'utf8'));
+            } catch {
+              return null;
+            }
+          }
+          
+          function calculatePercentile(values, percentile) {
+            if (values.length === 0) return 0;
+            const sorted = values.slice().sort((a, b) => a - b);
+            const index = Math.ceil((percentile / 100) * sorted.length) - 1;
+            return sorted[index];
+          }
+          
+          const scenarios = ['light', 'normal', 'burst', 'sustained']
+            .map(name => loadJSON(`scenario-${name}.json`))
+            .filter(Boolean);
+          
+          const dedupResults = loadJSON('dedup-test-results.json');
+          const optResults = loadJSON('optimization-test-results.json');
+          const healthResults = loadJSON('health-check-results.json');
+          
+          // Aggregate scenario metrics
+          const scenarioMetrics = scenarios.map(scenario => {
+            const latencies = [
+              scenario.latency.p50,
+              scenario.latency.p75,
+              scenario.latency.p90,
+              scenario.latency.p95,
+              scenario.latency.p99
+            ];
+            
+            return {
+              name: scenario.title,
+              duration_s: scenario.duration,
+              total_requests: scenario.requests.total,
+              avg_rps: Math.round(scenario.requests.average),
+              avg_throughput_bps: Math.round(scenario.throughput.average),
+              latency: {
+                mean: Math.round(scenario.latency.mean),
+                p50: Math.round(scenario.latency.p50),
+                p75: Math.round(scenario.latency.p75),
+                p90: Math.round(scenario.latency.p90),
+                p95: Math.round(scenario.latency.p95),
+                p99: Math.round(scenario.latency.p99),
+                max: Math.round(scenario.latency.max)
+              },
+              errors: scenario.errors || 0,
+              timeouts: scenario.timeouts || 0,
+              non2xx: scenario.non2xx || 0,
+              error_rate: ((scenario.errors + scenario.timeouts + scenario.non2xx) / scenario.requests.total * 100).toFixed(2)
+            };
+          });
+          
+          // Calculate aggregate statistics
+          const allLatencyP95 = scenarioMetrics.map(s => s.latency.p95);
+          const allRPS = scenarioMetrics.map(s => s.avg_rps);
+          const allErrorRates = scenarioMetrics.map(s => parseFloat(s.error_rate));
+          
+          const aggregateStats = {
+            latency_p95: {
+              min: Math.min(...allLatencyP95),
+              max: Math.max(...allLatencyP95),
+              avg: Math.round(allLatencyP95.reduce((a, b) => a + b, 0) / allLatencyP95.length)
+            },
+            throughput_rps: {
+              min: Math.min(...allRPS),
+              max: Math.max(...allRPS),
+              avg: Math.round(allRPS.reduce((a, b) => a + b, 0) / allRPS.length)
+            },
+            error_rate: {
+              min: Math.min(...allErrorRates).toFixed(2),
+              max: Math.max(...allErrorRates).toFixed(2),
+              avg: (allErrorRates.reduce((a, b) => a + b, 0) / allErrorRates.length).toFixed(2)
+            }
+          };
+          
+          // Generate recommendations
+          const recommendations = [];
+          
+          if (aggregateStats.latency_p95.avg > ${{ env.ALERT_THRESHOLD_P95_MS }}) {
+            recommendations.push({
+              priority: 'high',
+              category: 'latency',
+              metric: 'p95_latency',
+              current_value: aggregateStats.latency_p95.avg,
+              threshold: ${{ env.ALERT_THRESHOLD_P95_MS }},
+              issue: `Average P95 latency (${aggregateStats.latency_p95.avg}ms) exceeds threshold (${${{ env.ALERT_THRESHOLD_P95_MS }}}ms)`,
+              suggestions: [
+                'Review connection pool size (POOL_MAX_SIZE) - current: 20, suggested: 30-40',
+                'Adjust adaptive timeout multiplier (TIMEOUT_MULTIPLIER) - current: 3.5, suggested: 4.0',
+                'Increase buffer watermark thresholds for bulk transfers'
+              ]
+            });
+          }
+          
+          if (parseFloat(aggregateStats.error_rate.avg) > ${{ env.ALERT_THRESHOLD_ERROR_RATE }}) {
+            recommendations.push({
+              priority: 'critical',
+              category: 'reliability',
+              metric: 'error_rate',
+              current_value: parseFloat(aggregateStats.error_rate.avg),
+              threshold: ${{ env.ALERT_THRESHOLD_ERROR_RATE }},
+              issue: `Average error rate (${aggregateStats.error_rate.avg}%) exceeds threshold (${${{ env.ALERT_THRESHOLD_ERROR_RATE }}}%)`,
+              suggestions: [
+                'Increase retry attempts (RETRY_MAX_ATTEMPTS) - current: 3, suggested: 4-5',
+                'Adjust retry base delay (RETRY_BASE_DELAY) - current: 1000ms, suggested: 800ms',
+                'Review proxy health and connection stability'
+              ]
+            });
+          }
+          
+          if (dedupResults && parseFloat(dedupResults.avg_dedup_efficiency) < ${{ env.ALERT_THRESHOLD_DEDUP_EFFICIENCY }}) {
+            recommendations.push({
+              priority: 'medium',
+              category: 'optimization',
+              metric: 'dedup_efficiency',
+              current_value: parseFloat(dedupResults.avg_dedup_efficiency),
+              threshold: ${{ env.ALERT_THRESHOLD_DEDUP_EFFICIENCY }},
+              issue: `Deduplication efficiency (${dedupResults.avg_dedup_efficiency}%) below target (${${{ env.ALERT_THRESHOLD_DEDUP_EFFICIENCY }}}%)`,
+              suggestions: [
+                'Increase REQUEST_COALESCE_TTL - current: 2000ms, suggested: 3000-4000ms',
+                'Increase REQUEST_COALESCE_MAX_SIZE - current: 100, suggested: 150-200',
+                'Review traffic patterns for better coalescing opportunities'
+              ]
+            });
+          }
+          
+          // Optimization stack validation
+          const optValidation = optResults ? {
+            tests_passed: optResults.tests_passed,
+            tests_failed: optResults.tests_failed,
+            pass_rate: ((optResults.tests_passed / optResults.tests_run) * 100).toFixed(2),
+            failing_optimizations: optResults.results
+              .filter(r => !r.validation.passed)
+              .map(r => r.optimization)
+          } : null;
+          
+          if (optValidation && optValidation.tests_failed > 0) {
+            recommendations.push({
+              priority: 'high',
+              category: 'regression',
+              metric: 'optimization_tests',
+              current_value: optValidation.pass_rate,
+              threshold: 100,
+              issue: `${optValidation.tests_failed} optimization test(s) failing`,
+              suggestions: [
+                `Review failing optimizations: ${optValidation.failing_optimizations.join(', ')}`,
+                'Check recent code changes for regressions',
+                'Validate optimization constants are correctly set'
+              ]
+            });
+          }
+          
+          // Determine overall health status
+          let healthStatus = 'healthy';
+          if (recommendations.some(r => r.priority === 'critical')) {
+            healthStatus = 'critical';
+          } else if (recommendations.some(r => r.priority === 'high')) {
+            healthStatus = 'warning';
+          } else if (recommendations.length > 0) {
+            healthStatus = 'advisory';
+          }
+          
+          const analysis = {
+            timestamp: new Date().toISOString(),
+            commit: '${{ github.sha }}',
+            branch: '${{ github.ref_name }}',
+            workflow_run: '${{ github.run_number }}',
+            health_status: healthStatus,
+            scenarios: scenarioMetrics,
+            aggregate_statistics: aggregateStats,
+            deduplication: dedupResults ? {
+              avg_efficiency: dedupResults.avg_dedup_efficiency,
+              avg_cache_hit_rate: dedupResults.avg_cache_hit_rate,
+              overall_success_rate: dedupResults.overall_success_rate,
+              total_requests_tested: dedupResults.total_requests
+            } : null,
+            optimization_validation: optValidation,
+            endpoint_health: healthResults ? {
+              total: healthResults.total_endpoints,
+              healthy: healthResults.healthy,
+              unhealthy: healthResults.unhealthy,
+              errors: healthResults.errors,
+              critical_failures: healthResults.critical_failures,
+              avg_latency_ms: healthResults.avg_latency_ms
+            } : null,
+            recommendations: recommendations,
+            thresholds: {
+              p95_latency_ms: ${{ env.ALERT_THRESHOLD_P95_MS }},
+              error_rate_pct: ${{ env.ALERT_THRESHOLD_ERROR_RATE }},
+              dedup_efficiency_pct: ${{ env.ALERT_THRESHOLD_DEDUP_EFFICIENCY }}
+            }
+          };
+          
+          console.log('\n📊 Complete Analysis:');
+          console.log(JSON.stringify(analysis, null, 2));
+          
+          fs.writeFileSync('performance-analysis.json', JSON.stringify(analysis, null, 2));
+          
+          // Export key metrics for GitHub Actions outputs
+          fs.writeFileSync(process.env.GITHUB_OUTPUT, 
+            `health_status=${healthStatus}\n` +
+            `p95_latency=${aggregateStats.latency_p95.avg}\n` +
+            `avg_rps=${aggregateStats.throughput_rps.avg}\n` +
+            `error_rate=${aggregateStats.error_rate.avg}\n` +
+            `recommendations_count=${recommendations.length}\n`
+          );
+          EOF
+      
+      - name: Load historical data & detect trends
+        id: trend_analysis
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          
+          const currentAnalysis = JSON.parse(fs.readFileSync('performance-analysis.json', 'utf8'));
+          const historicalData = JSON.parse(fs.readFileSync('.github/monitoring/trends/historical.json', 'utf8'));
+          
+          // Add current data point
+          historicalData.data_points.push({
+            timestamp: currentAnalysis.timestamp,
+            commit: currentAnalysis.commit,
+            p95_latency: currentAnalysis.aggregate_statistics.latency_p95.avg,
+            avg_rps: currentAnalysis.aggregate_statistics.throughput_rps.avg,
+            error_rate: parseFloat(currentAnalysis.aggregate_statistics.error_rate.avg),
+            dedup_efficiency: currentAnalysis.deduplication ? parseFloat(currentAnalysis.deduplication.avg_efficiency) : null
+          });
+          
+          // Keep only last 100 data points (~ 50 hours at 30min intervals)
+          if (historicalData.data_points.length > 100) {
+            historicalData.data_points = historicalData.data_points.slice(-100);
+          }
+          
+          historicalData.last_updated = new Date().toISOString();
+          
+          // Calculate trends (if enough data points)
+          if (historicalData.data_points.length >= 10) {
+            const recent = historicalData.data_points.slice(-10);
+            const older = historicalData.data_points.slice(-20, -10);
+            
+            const recentAvgP95 = recent.reduce((sum, p) => sum + p.p95_latency, 0) / recent.length;
+            const olderAvgP95 = older.length > 0 ? older.reduce((sum, p) => sum + p.p95_latency, 0) / older.length : recentAvgP95;
+            
+            const recentAvgRPS = recent.reduce((sum, p) => sum + p.avg_rps, 0) / recent.length;
+            const olderAvgRPS = older.length > 0 ? older.reduce((sum, p) => sum + p.avg_rps, 0) / older.length : recentAvgRPS;
+            
+            historicalData.trends = {
+              p95_latency: {
+                direction: recentAvgP95 > olderAvgP95 * 1.1 ? 'increasing' : recentAvgP95 < olderAvgP95 * 0.9 ? 'decreasing' : 'stable',
+                change_pct: (((recentAvgP95 - olderAvgP95) / olderAvgP95) * 100).toFixed(2)
+              },
+              throughput: {
+                direction: recentAvgRPS > olderAvgRPS * 1.1 ? 'increasing' : recentAvgRPS < olderAvgRPS * 0.9 ? 'decreasing' : 'stable',
+                change_pct: (((recentAvgRPS - olderAvgRPS) / olderAvgRPS) * 100).toFixed(2)
+              }
+            };
+          }
+          
+          fs.writeFileSync('.github/monitoring/trends/historical.json', JSON.stringify(historicalData, null, 2));
+          
+          console.log('\n📈 Trend Analysis:');
+          console.log(JSON.stringify(historicalData.trends || {}, null, 2));
+          EOF
+      
+      - name: Generate comprehensive report
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          
+          const analysis = JSON.parse(fs.readFileSync('performance-analysis.json', 'utf8'));
+          const historical = JSON.parse(fs.readFileSync('.github/monitoring/trends/historical.json', 'utf8'));
+          
+          const statusEmoji = {
+            healthy: '✅',
+            advisory: 'ℹ️',
+            warning: '⚠️',
+            critical: '🚨'
+          };
+          
+          const priorityEmoji = {
+            info: 'ℹ️',
+            medium: '💡',
+            high: '⚠️',
+            critical: '🚨'
+          };
+          
+          let report = `# 📊 Performance Monitoring Report
+
+**Generated:** ${new Date().toISOString()}  
+**Commit:** [\`${analysis.commit.substring(0, 7)}\`](https://github.com/${{ github.repository }}/commit/${analysis.commit})  
+**Branch:** \`${analysis.branch}\`  
+**Run:** [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})  
+**Status:** ${statusEmoji[analysis.health_status]} **${analysis.health_status.toUpperCase()}**
+
+---
+
+## 🎯 Aggregate Statistics
+
+| Metric | Min | Avg | Max | Status |
+|--------|-----|-----|-----|--------|
+| **P95 Latency** | ${analysis.aggregate_statistics.latency_p95.min}ms | ${analysis.aggregate_statistics.latency_p95.avg}ms | ${analysis.aggregate_statistics.latency_p95.max}ms | ${analysis.aggregate_statistics.latency_p95.avg < 1000 ? '✅' : '⚠️'} |
+| **Throughput** | ${analysis.aggregate_statistics.throughput_rps.min} RPS | ${analysis.aggregate_statistics.throughput_rps.avg} RPS | ${analysis.aggregate_statistics.throughput_rps.max} RPS | ✅ |
+| **Error Rate** | ${analysis.aggregate_statistics.error_rate.min}% | ${analysis.aggregate_statistics.error_rate.avg}% | ${analysis.aggregate_statistics.error_rate.max}% | ${parseFloat(analysis.aggregate_statistics.error_rate.avg) < 1 ? '✅' : '❌'} |
+
+## 📈 Scenario Results
+
+`;
+
+          analysis.scenarios.forEach(scenario => {
+            report += `### ${scenario.name.charAt(0).toUpperCase() + scenario.name.slice(1)} Load
+            
+| Metric | Value |
+|--------|-------|
+| Duration | ${scenario.duration_s}s |
+| Total Requests | ${scenario.total_requests.toLocaleString()} |
+| Avg RPS | ${scenario.avg_rps.toLocaleString()} |
+| P50 Latency | ${scenario.latency.p50}ms |
+| P95 Latency | ${scenario.latency.p95}ms |
+| P99 Latency | ${scenario.latency.p99}ms |
+| Error Rate | ${scenario.error_rate}% |
+
+`;
+          });
+
+          if (analysis.deduplication) {
+            report += `## 🔄 Deduplication Performance (Opt-17)
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| Avg Efficiency | ${analysis.deduplication.avg_efficiency}% | ${parseFloat(analysis.deduplication.avg_efficiency) > 70 ? '✅' : '⚠️'} |
+| Cache Hit Rate | ${analysis.deduplication.avg_cache_hit_rate}% | ${parseFloat(analysis.deduplication.avg_cache_hit_rate) > 50 ? '✅' : '⚠️'} |
+| Success Rate | ${analysis.deduplication.overall_success_rate}% | ${parseFloat(analysis.deduplication.overall_success_rate) > 99 ? '✅' : '⚠️'} |
+| Total Requests Tested | ${analysis.deduplication.total_requests_tested.toLocaleString()} | ✅ |
+
+`;
+          }
+
+          if (analysis.optimization_validation) {
+            report += `## 🔧 Optimization Stack Validation
+
+| Metric | Value |
+|--------|-------|
+| Tests Passed | ${analysis.optimization_validation.tests_passed} |
+| Tests Failed | ${analysis.optimization_validation.tests_failed} |
+| Pass Rate | ${analysis.optimization_validation.pass_rate}% ${parseFloat(analysis.optimization_validation.pass_rate) === 100 ? '✅' : '⚠️'} |
+
+`;
+            if (analysis.optimization_validation.failing_optimizations.length > 0) {
+              report += `**⚠️ Failing Optimizations:**\n`;
+              analysis.optimization_validation.failing_optimizations.forEach(opt => {
+                report += `- ${opt}\n`;
+              });
+              report += '\n';
+            }
+          }
+
+          if (analysis.endpoint_health) {
+            report += `## 💊 Endpoint Health
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| Total Endpoints | ${analysis.endpoint_health.total} | - |
+| Healthy | ${analysis.endpoint_health.healthy} | ✅ |
+| Unhealthy | ${analysis.endpoint_health.unhealthy} | ${analysis.endpoint_health.unhealthy === 0 ? '✅' : '⚠️'} |
+| Errors | ${analysis.endpoint_health.errors} | ${analysis.endpoint_health.errors === 0 ? '✅' : '❌'} |
+| Critical Failures | ${analysis.endpoint_health.critical_failures} | ${analysis.endpoint_health.critical_failures === 0 ? '✅' : '🚨'} |
+| Avg Latency | ${analysis.endpoint_health.avg_latency_ms}ms | ✅ |
+
+`;
+          }
+
+          if (historical.trends) {
+            report += `## 📊 Trends (Last 10 vs Previous 10 Runs)
+
+| Metric | Direction | Change |
+|--------|-----------|--------|
+| P95 Latency | ${historical.trends.p95_latency.direction} | ${historical.trends.p95_latency.change_pct}% |
+| Throughput | ${historical.trends.throughput.direction} | ${historical.trends.throughput.change_pct}% |
+
+`;
+          }
+
+          if (analysis.recommendations.length > 0) {
+            report += `## 💡 Recommendations
+
+`;
+            analysis.recommendations.forEach((rec, idx) => {
+              report += `### ${priorityEmoji[rec.priority]} ${rec.priority.toUpperCase()}: ${rec.category}
+
+**Issue:** ${rec.issue}
+
+**Current Value:** ${rec.current_value} | **Threshold:** ${rec.threshold}
+
+**Suggested Actions:**
+`;
+              rec.suggestions.forEach(suggestion => {
+                report += `- ${suggestion}\n`;
+              });
+              report += '\n';
+            });
+          } else {
+            report += `## ✅ No Issues Detected
+
+All metrics are within acceptable thresholds. System is operating optimally.
+
+`;
+          }
+
+          report += `## 🎯 Thresholds
+
+| Metric | Threshold |
+|--------|-----------|
+| P95 Latency | < ${analysis.thresholds.p95_latency_ms}ms |
+| Error Rate | < ${analysis.thresholds.error_rate_pct}% |
+| Dedup Efficiency | > ${analysis.thresholds.dedup_efficiency_pct}% |
+
+---
+
+## 📁 Data Files
+
+- Raw metrics: [Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+- Historical trends: \`.github/monitoring/trends/historical.json\`
+- Detailed analysis: \`performance-analysis.json\`
+
+---
+
+*This report is automatically generated by the Performance Monitoring system. Data is collected every 30 minutes for statistical analysis and code adjustment decisions.*
+`;
+
+          fs.writeFileSync('performance-report.md', report);
+          console.log('\n📄 Report generated successfully');
+          EOF
+      
+      - name: Save metrics with timestamp
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+          DATE=$(date -u +"%Y-%m-%d")
+          
+          # Save raw metrics
+          cp performance-analysis.json ".github/monitoring/metrics/raw/metrics-${TIMESTAMP}.json"
+          
+          # Create daily aggregation if it's a new day
+          DAILY_FILE=".github/monitoring/metrics/daily/metrics-${DATE}.json"
+          if [ ! -f "$DAILY_FILE" ]; then
+            echo '{"date": "'$DATE'", "data_points": []}' > "$DAILY_FILE"
+          fi
+          
+          # Append to daily file
+          jq --argjson new "$(cat performance-analysis.json)" '.data_points += [$new]' "$DAILY_FILE" > tmp.json && mv tmp.json "$DAILY_FILE"
+          
+          echo "METRICS_TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          echo "METRICS_DATE=$DATE" >> $GITHUB_ENV
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-metrics-${{ github.run_number }}-${{ env.METRICS_TIMESTAMP }}
+          path: |
+            performance-analysis.json
+            performance-report.md
+            scenario-*.json
+            dedup-test-results.json
+            optimization-test-results.json
+            health-check-results.json
+          retention-days: 90
+      
+      - name: Commit metrics to repository
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add .github/monitoring/
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore(monitoring): performance metrics ${{ env.METRICS_TIMESTAMP }}
+
+📊 Performance Summary:
+- Status: ${{ steps.analyze.outputs.health_status }}
+- P95 Latency: ${{ steps.analyze.outputs.p95_latency }}ms
+- Throughput: ${{ steps.analyze.outputs.avg_rps }} RPS
+- Error Rate: ${{ steps.analyze.outputs.error_rate }}%
+- Recommendations: ${{ steps.analyze.outputs.recommendations_count }}
+
+[skip ci]"
+            git push
+          fi
+      
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('performance-report.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+      
+      - name: Create issue on critical status
+        if: steps.analyze.outputs.health_status == 'critical'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const analysis = JSON.parse(fs.readFileSync('performance-analysis.json', 'utf8'));
+            
+            const criticalIssues = analysis.recommendations
+              .filter(r => r.priority === 'critical')
+              .map(r => `### 🚨 ${r.category}\n\n**Issue:** ${r.issue}\n\n**Suggestions:**\n${r.suggestions.map(s => `- ${s}`).join('\n')}`)
+              .join('\n\n');
+            
+            const body = `## 🚨 Critical Performance Alert
+
+**Detected at:** ${analysis.timestamp}  
+**Commit:** ${analysis.commit}  
+**Branch:** ${analysis.branch}
+
+### Issues Detected:
+
+${criticalIssues}
+
+### Key Metrics:
+
+- **P95 Latency:** ${analysis.aggregate_statistics.latency_p95.avg}ms (threshold: ${analysis.thresholds.p95_latency_ms}ms)
+- **Error Rate:** ${analysis.aggregate_statistics.error_rate.avg}% (threshold: ${analysis.thresholds.error_rate_pct}%)
+- **Throughput:** ${analysis.aggregate_statistics.throughput_rps.avg} RPS
+
+### Full Report:
+
+[View detailed analysis in artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+### Action Required:
+
+Please review the performance metrics and implement suggested optimizations immediately.
+
+---
+
+*This issue was automatically created by the Performance Monitoring system*`;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Critical Performance Issue - ${new Date().toISOString().split('T')[0]}`,
+              body: body,
+              labels: ['performance', 'critical', 'automated']
+            });
