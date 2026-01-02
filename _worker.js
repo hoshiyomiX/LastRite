@@ -63,6 +63,16 @@ const retryStats = {
   totalDelay: 0
 };
 
+// OPTIMIZATION 17: Request deduplication
+const pendingRequests = new Map(); // Track in-flight requests
+const REQUEST_COALESCE_TTL = 2000; // 2s window for coalescing
+const REQUEST_COALESCE_MAX_SIZE = 100; // Max pending requests
+const coalesceStats = {
+  hits: 0,        // Requests served from pending
+  misses: 0,      // Unique requests
+  saved: 0        // Total duplicate requests avoided
+};
+
 // Constant
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -106,6 +116,78 @@ const CORS_HEADER_OPTIONS = {
 
 // Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+
+// OPTIMIZATION 17: Request deduplication helpers
+function getRequestKey(request) {
+  const url = new URL(request.url);
+  const params = new URLSearchParams();
+  
+  // Normalized params (same as cache key)
+  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
+  for (const key of paramKeys) {
+    const value = url.searchParams.get(key);
+    if (value) params.set(key, value);
+  }
+  
+  return url.pathname + '?' + params.toString();
+}
+
+async function deduplicateRequest(request, handler) {
+  // Only deduplicate GET requests
+  if (request.method !== 'GET') {
+    return handler();
+  }
+  
+  const requestKey = getRequestKey(request);
+  
+  // Check if identical request is already pending
+  if (pendingRequests.has(requestKey)) {
+    coalesceStats.hits++;
+    coalesceStats.saved++;
+    
+    console.log(`[Dedup] Coalescing request: ${requestKey} (hit #${coalesceStats.hits})`);
+    
+    // Wait for the in-flight request to complete
+    const result = await pendingRequests.get(requestKey);
+    
+    // Clone response to allow multiple reads
+    return result.clone();
+  }
+  
+  // Evict oldest entry if map is full
+  if (pendingRequests.size >= REQUEST_COALESCE_MAX_SIZE) {
+    const firstKey = pendingRequests.keys().next().value;
+    pendingRequests.delete(firstKey);
+    console.log(`[Dedup] Evicted oldest entry: ${firstKey}`);
+  }
+  
+  // No pending request, execute handler
+  coalesceStats.misses++;
+  console.log(`[Dedup] New request: ${requestKey} (miss #${coalesceStats.misses})`);
+  
+  // Create promise for this request
+  const promise = handler()
+    .then(response => {
+      // Store briefly for sharing (auto-cleanup after TTL)
+      setTimeout(() => {
+        if (pendingRequests.has(requestKey)) {
+          pendingRequests.delete(requestKey);
+          console.log(`[Dedup] Expired: ${requestKey} (TTL cleanup)`);
+        }
+      }, REQUEST_COALESCE_TTL);
+      
+      return response;
+    })
+    .catch(err => {
+      // Remove on error immediately
+      pendingRequests.delete(requestKey);
+      console.error(`[Dedup] Error, removed: ${requestKey}`, err);
+      throw err;
+    });
+  
+  pendingRequests.set(requestKey, promise);
+  return promise;
+}
 
 // OPTIMIZATION 16: Retry helper functions
 function calculateBackoff(attempt) {
@@ -602,130 +684,134 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          return handleCachedRequest(request, async () => {
-            const offset = +url.searchParams.get("offset") || 0;
-            const filterCC = url.searchParams.get("cc")?.split(",") || [];
-            const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
-            const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
-            const filterLimit = Math.min(
-              +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
-              MAX_CONFIGS_PER_REQUEST
-            );
-            const filterFormat = url.searchParams.get("format") || "raw";
-            const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
-
-            const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
-            
-            const { data: prxList, pagination } = await getPrxListPaginated(
-              prxBankUrl,
-              { offset, limit: filterLimit, filterCC },
-              env
-            );
-
-            const uuid = crypto.randomUUID();
-            const ssUsername = btoa(`none:${uuid}`);
-            
-            const responseHeaders = {
-              ...CORS_HEADER_OPTIONS,
-              "X-Pagination-Offset": offset.toString(),
-              "X-Pagination-Limit": filterLimit.toString(),
-              "X-Pagination-Total": pagination.total.toString(),
-              "X-Pagination-Has-More": pagination.hasMore.toString(),
-            };
-
-            if (pagination.nextOffset !== null) {
-              responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
-            }
-
-            // OPTIMIZATION 11: Use streaming for raw and v2ray formats
-            if (filterFormat === "raw") {
-              responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-              responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              
-              const configStream = generateConfigsStream(
-                prxList, filterPort, filterVPN, filterLimit, 
-                fillerDomain, uuid, ssUsername
+          // OPTIMIZATION 17: Add request deduplication layer
+          return deduplicateRequest(request, () => {
+            return handleCachedRequest(request, async () => {
+              const offset = +url.searchParams.get("offset") || 0;
+              const filterCC = url.searchParams.get("cc")?.split(",") || [];
+              const filterPort = url.searchParams.get("port")?.split(",").map(p => +p).filter(Boolean) || PORTS;
+              const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
+              const filterLimit = Math.min(
+                +url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST,
+                MAX_CONFIGS_PER_REQUEST
               );
+              const filterFormat = url.searchParams.get("format") || "raw";
+              const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
+
+              const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
               
-              return createStreamingResponse(configStream, responseHeaders, filterFormat);
-              
-            } else if (filterFormat === PROTOCOL_V2) {
-              // For v2ray, we need to collect all configs first (base64 encoding requirement)
-              const result = [];
-              const configStream = generateConfigsStream(
-                prxList, filterPort, filterVPN, filterLimit,
-                fillerDomain, uuid, ssUsername
+              const { data: prxList, pagination } = await getPrxListPaginated(
+                prxBankUrl,
+                { offset, limit: filterLimit, filterCC },
+                env
               );
+
+              const uuid = crypto.randomUUID();
+              const ssUsername = btoa(`none:${uuid}`);
               
-              for await (const config of configStream) {
-                result.push(config);
+              const responseHeaders = {
+                ...CORS_HEADER_OPTIONS,
+                "X-Pagination-Offset": offset.toString(),
+                "X-Pagination-Limit": filterLimit.toString(),
+                "X-Pagination-Total": pagination.total.toString(),
+                "X-Pagination-Has-More": pagination.hasMore.toString(),
+                "X-Dedup-Stats": `hits=${coalesceStats.hits} misses=${coalesceStats.misses} saved=${coalesceStats.saved}`,
+              };
+
+              if (pagination.nextOffset !== null) {
+                responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
               }
-              
-              const finalResult = btoa(result.join("\n"));
-              responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-              responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
-              
-              return new Response(finalResult, {
-                status: 200,
-                headers: responseHeaders,
-              });
-              
-            } else if ([PROTOCOL_NEKO, "sfa", "bfr"].includes(filterFormat)) {
-              // For converter formats, collect configs first
-              const result = [];
-              const configStream = generateConfigsStream(
-                prxList, filterPort, filterVPN, filterLimit,
-                fillerDomain, uuid, ssUsername
-              );
-              
-              for await (const config of configStream) {
-                result.push(config);
-              }
-              
-              const converterPromise = fetch(CONVERTER_URL, {
-                method: "POST",
-                body: JSON.stringify({
-                  url: result.join(","),
-                  format: filterFormat,
-                  template: "cf",
-                }),
-              });
 
-              const res = await Promise.race([
-                converterPromise,
-                new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error("Converter timeout")), 8000)
-                ),
-              ]).catch(err => {
-                return new Response(JSON.stringify({ error: "Converter service timeout" }), {
-                  status: 504,
-                  headers: { 
-                    ...CORS_HEADER_OPTIONS,
-                    "Content-Type": "application/json"
-                  },
-                });
-              });
-
-              if (res.status == 200) {
-                const finalResult = await res.text();
-                const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
-                responseHeaders["Content-Type"] = contentType;
+              // OPTIMIZATION 11: Use streaming for raw and v2ray formats
+              if (filterFormat === "raw") {
+                responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
+                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                
+                const configStream = generateConfigsStream(
+                  prxList, filterPort, filterVPN, filterLimit, 
+                  fillerDomain, uuid, ssUsername
+                );
+                
+                return createStreamingResponse(configStream, responseHeaders, filterFormat);
+                
+              } else if (filterFormat === PROTOCOL_V2) {
+                // For v2ray, we need to collect all configs first (base64 encoding requirement)
+                const result = [];
+                const configStream = generateConfigsStream(
+                  prxList, filterPort, filterVPN, filterLimit,
+                  fillerDomain, uuid, ssUsername
+                );
+                
+                for await (const config of configStream) {
+                  result.push(config);
+                }
+                
+                const finalResult = btoa(result.join("\n"));
+                responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
                 responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
                 
                 return new Response(finalResult, {
                   status: 200,
                   headers: responseHeaders,
                 });
-              } else {
-                return new Response(res.statusText, {
-                  status: res.status,
-                  headers: { 
-                    ...CORS_HEADER_OPTIONS,
-                    "Content-Type": "text/plain; charset=utf-8"
-                  },
+                
+              } else if ([PROTOCOL_NEKO, "sfa", "bfr"].includes(filterFormat)) {
+                // For converter formats, collect configs first
+                const result = [];
+                const configStream = generateConfigsStream(
+                  prxList, filterPort, filterVPN, filterLimit,
+                  fillerDomain, uuid, ssUsername
+                );
+                
+                for await (const config of configStream) {
+                  result.push(config);
+                }
+                
+                const converterPromise = fetch(CONVERTER_URL, {
+                  method: "POST",
+                  body: JSON.stringify({
+                    url: result.join(","),
+                    format: filterFormat,
+                    template: "cf",
+                  }),
                 });
+
+                const res = await Promise.race([
+                  converterPromise,
+                  new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error("Converter timeout")), 8000)
+                  ),
+                ]).catch(err => {
+                  return new Response(JSON.stringify({ error: "Converter service timeout" }), {
+                    status: 504,
+                    headers: { 
+                      ...CORS_HEADER_OPTIONS,
+                      "Content-Type": "application/json"
+                    },
+                  });
+                });
+
+                if (res.status == 200) {
+                  const finalResult = await res.text();
+                  const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
+                  responseHeaders["Content-Type"] = contentType;
+                  responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                  
+                  return new Response(finalResult, {
+                    status: 200,
+                    headers: responseHeaders,
+                  });
+                } else {
+                  return new Response(res.statusText, {
+                    status: res.status,
+                    headers: { 
+                      ...CORS_HEADER_OPTIONS,
+                      "Content-Type": "text/plain; charset=utf-8"
+                    },
+                  });
+                }
               }
-            }
+            });
           });
         } else if (apiPath.startsWith("/myip")) {
           return new Response(
