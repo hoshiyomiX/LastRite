@@ -32,6 +32,7 @@ const TIMEOUT_MIN = 8000;          // Minimum timeout: 8s
 const TIMEOUT_MAX = 45000;         // Maximum timeout: 45s
 const TIMEOUT_MULTIPLIER = 3.5;    // Timeout = RTT * multiplier
 const TIMEOUT_DEFAULT = 25000;     // Default when no history
+const UDP_RELAY_TIMEOUT = 15000;   // Fixed 15s timeout for UDP relay
 const timeoutStats = { 
   adaptive: 0, 
   default: 0, 
@@ -1137,10 +1138,12 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
       }
     });
 
-    // OPTIMIZATION 14: Use adaptive timeout for UDP relay
-    const adaptiveTimeout = calculateAdaptiveTimeout(relay.host, relay.port, log);
+    // Use fixed timeout for UDP relay (not adaptive)
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`UDP relay timeout (${adaptiveTimeout}ms)`)), adaptiveTimeout)
+      setTimeout(() => {
+        log(`UDP relay timeout after ${UDP_RELAY_TIMEOUT}ms`);
+        reject(new Error(`UDP relay timeout`));
+      }, UDP_RELAY_TIMEOUT)
     );
 
     const tcpSocket = await Promise.race([connectPromise, timeoutPromise]);
@@ -1166,15 +1169,24 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
           }
         },
         close() {
-          log(`UDP connection to ${targetAddress} closed`);
+          log(`UDP connection to ${targetAddress}:${targetPort} closed normally`);
         },
         abort(reason) {
-          console.error(`UDP connection aborted due to ${reason}`);
+          log(`UDP connection aborted:`, {
+            target: `${targetAddress}:${targetPort}`,
+            reason: reason?.message || reason?.toString() || 'Unknown',
+            timestamp: new Date().toISOString()
+          });
         },
       })
     );
   } catch (e) {
-    console.error(`Error while handling UDP outbound: ${e.message}`);
+    log(`UDP outbound error:`, {
+      target: `${targetAddress}:${targetPort}`,
+      error: e.message || e.toString(),
+      stack: e.stack,
+      timestamp: new Date().toISOString()
+    });
     safeCloseWebSocket(webSocket);
   }
 }
@@ -1198,7 +1210,13 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         controller.close();
       });
       webSocketServer.addEventListener("error", (err) => {
-        log("webSocketServer has error");
+        log("WebSocket error:", {
+          message: err.message || 'Unknown error',
+          type: err.type || 'Unknown type',
+          code: err.code,
+          readyState: webSocketServer.readyState,
+          timestamp: new Date().toISOString()
+        });
         controller.error(err);
       });
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
