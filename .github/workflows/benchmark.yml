@@ -2,7 +2,7 @@ name: Network Benchmark
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Every 30 minutes
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -29,7 +29,6 @@ jobs:
           const http = require('http');
           const fs = require('fs');
           
-          // Domains from wrangler.toml
           const DOMAINS = [
             'hoshiyomi.qzz.io',
             'hoshiyomi.web.id',
@@ -37,7 +36,6 @@ jobs:
             'api24-normal.tiktokv.com.hoshiyomi.qzz.io'
           ];
           
-          // Helper: HTTP request wrapper
           function request(url) {
             return new Promise((resolve, reject) => {
               const protocol = url.startsWith('https') ? https : http;
@@ -60,7 +58,6 @@ jobs:
             });
           }
           
-          // Test 1: Ping (Latency)
           async function testPing(domain) {
             const results = [];
             
@@ -79,7 +76,6 @@ jobs:
             return { avg_latency_ms: avg, samples: valid.length };
           }
           
-          // Test 2: Download Speed
           async function testDownload(domain) {
             try {
               const { duration, size } = await request(
@@ -99,7 +95,6 @@ jobs:
             }
           }
           
-          // Test 3: Video Stream (chunk loading)
           async function testVideoStream(domain) {
             const chunks = 5;
             let successChunks = 0;
@@ -117,7 +112,6 @@ jobs:
                 
                 if (duration > 2000) bufferStalls++;
                 
-                // Simulate playback interval
                 await new Promise(r => setTimeout(r, 100));
               } catch (err) {
                 // Skip failed chunk
@@ -136,7 +130,6 @@ jobs:
             };
           }
           
-          // Test 4: Voice Call (packet simulation)
           async function testVoiceCall(domain) {
             const packets = 30;
             const interval = 100;
@@ -170,7 +163,6 @@ jobs:
               Math.round(jitter.reduce((a,b) => a+b, 0) / jitter.length) : -1;
             const packetLoss = ((packets - successPackets) / packets * 100).toFixed(2);
             
-            // Quality assessment (ITU-T G.114)
             let callQuality;
             if (avgLatency < 150 && avgJitter < 30 && parseFloat(packetLoss) < 1) {
               callQuality = 'excellent';
@@ -191,32 +183,22 @@ jobs:
             };
           }
           
-          // Main benchmark runner
           async function runBenchmark() {
             console.log('Starting network benchmark...');
-            console.log('Testing domains from wrangler.toml\n');
             
             const results = {};
             
             for (const domain of DOMAINS) {
-              console.log(`\n━━━ Testing: ${domain} ━━━`);
+              console.log(`Testing: ${domain}`);
               
-              console.log('  [1/4] Ping test...');
               const ping = await testPing(domain);
-              
-              console.log('  [2/4] Download speed test...');
               const download = await testDownload(domain);
-              
-              console.log('  [3/4] Video stream test...');
               const video = await testVideoStream(domain);
-              
-              console.log('  [4/4] Voice call test...');
               const voice = await testVoiceCall(domain);
               
               results[domain] = { ping, download, video, voice };
             }
             
-            // Generate report
             const timestamp = new Date().toISOString();
             const logEntry = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -244,43 +226,35 @@ Commit: ${process.env.GITHUB_SHA || 'unknown'}
             
             logContent += '\n';
             
-            // Write to benchmark.log
             fs.appendFileSync('benchmark.log', logContent);
             
-            console.log('\n✅ Benchmark complete! Results appended to benchmark.log');
-            console.log(logContent);
+            console.log('Benchmark complete!');
           }
           
           runBenchmark().catch(console.error);
           EOF
       
-      - name: Purge Old Entries (Keep Last 10)
+      - name: Purge Old Entries
         run: |
           node << 'EOF'
           const fs = require('fs');
           
           if (!fs.existsSync('benchmark.log')) {
-            console.log('No benchmark.log found, skipping purge');
+            console.log('No benchmark.log found');
             process.exit(0);
           }
           
           const content = fs.readFileSync('benchmark.log', 'utf8');
-          
-          // Split by separator line (━━━━...)
           const separator = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
           const entries = content.split(separator).filter(e => e.trim().length > 0);
           
-          console.log(`Total entries found: ${entries.length}`);
+          console.log(`Total entries: ${entries.length}`);
           
-          // Keep only last 10 entries
           if (entries.length > 10) {
             const keep = entries.slice(-10);
             const newContent = keep.map(e => separator + e).join('');
-            
             fs.writeFileSync('benchmark.log', newContent);
-            console.log(`Purged ${entries.length - 10} old entries, kept last 10`);
-          } else {
-            console.log('No purge needed, entries <= 10');
+            console.log(`Purged ${entries.length - 10} old entries`);
           }
           EOF
       
@@ -288,11 +262,5 @@ Commit: ${process.env.GITHUB_SHA || 'unknown'}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
           git add benchmark.log
-          
-          if ! git diff --staged --quiet; then
-            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
-            git commit -m "benchmark: ${TIMESTAMP}" -m "Auto-generated by GitHub Actions" -m "[skip ci]"
-            git push
-          fi
+          git diff --staged --quiet || git commit -m "benchmark [skip ci]" && git push
