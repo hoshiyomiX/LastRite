@@ -114,13 +114,12 @@ jobs:
                 
                 await new Promise(r => setTimeout(r, 100));
               } catch (err) {
-                // Skip failed chunk
+                // Skip
               }
             }
             
             const avgChunkTime = successChunks > 0 ? Math.round(totalTime / successChunks) : -1;
-            const quality = bufferStalls === 0 ? 'smooth' : 
-                           bufferStalls <= 1 ? 'acceptable' : 'poor';
+            const quality = bufferStalls === 0 ? 'smooth' : bufferStalls <= 1 ? 'acceptable' : 'poor';
             
             return {
               avg_chunk_time_ms: avgChunkTime,
@@ -152,15 +151,13 @@ jobs:
                 
                 await new Promise(r => setTimeout(r, interval));
               } catch (err) {
-                // Packet dropped
+                // Dropped
               }
             }
             
-            const avgLatency = latencies.length > 0 ? 
-              Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length) : -1;
+            const avgLatency = latencies.length > 0 ? Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length) : -1;
             const maxLatency = latencies.length > 0 ? Math.max(...latencies) : -1;
-            const avgJitter = jitter.length > 0 ? 
-              Math.round(jitter.reduce((a,b) => a+b, 0) / jitter.length) : -1;
+            const avgJitter = jitter.length > 0 ? Math.round(jitter.reduce((a,b) => a+b, 0) / jitter.length) : -1;
             const packetLoss = ((packets - successPackets) / packets * 100).toFixed(2);
             
             let callQuality;
@@ -184,51 +181,42 @@ jobs:
           }
           
           async function runBenchmark() {
-            console.log('Starting network benchmark...');
+            console.log('Starting benchmark');
             
             const results = {};
             
             for (const domain of DOMAINS) {
-              console.log(`Testing: ${domain}`);
-              
+              console.log(`Testing ${domain}`);
               const ping = await testPing(domain);
               const download = await testDownload(domain);
               const video = await testVideoStream(domain);
               const voice = await testVoiceCall(domain);
-              
               results[domain] = { ping, download, video, voice };
             }
             
             const timestamp = new Date().toISOString();
-            const logEntry = `
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 NETWORK BENCHMARK RESULTS
-Timestamp: ${timestamp}
-Commit: ${process.env.GITHUB_SHA || 'unknown'}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-`;
-            
-            let logContent = logEntry;
+            let log = '\n' + '='.repeat(76) + '\n';
+            log += 'BENCHMARK RESULTS\n';
+            log += 'Timestamp: ' + timestamp + '\n';
+            log += '='.repeat(76) + '\n';
             
             for (const [domain, data] of Object.entries(results)) {
-              logContent += `\n🌐 ${domain}\n`;
-              logContent += `   🏓 Ping: ${data.ping.avg_latency_ms}ms (${data.ping.samples} samples)\n`;
+              log += '\nDomain: ' + domain + '\n';
+              log += '  Ping: ' + data.ping.avg_latency_ms + 'ms\n';
               
               if (data.download.error) {
-                logContent += `   ⬇️  Download: ERROR - ${data.download.error}\n`;
+                log += '  Download: ERROR\n';
               } else {
-                logContent += `   ⬇️  Download: ${data.download.speed_kbs} KB/s (${data.download.size_kb} KB in ${data.download.duration_ms}ms)\n`;
+                log += '  Download: ' + data.download.speed_kbs + ' KB/s\n';
               }
               
-              logContent += `   📹 Video: ${data.video.quality} (avg chunk: ${data.video.avg_chunk_time_ms}ms, stalls: ${data.video.buffer_stalls})\n`;
-              logContent += `   📞 Voice: ${data.voice.call_quality} (latency: ${data.voice.avg_latency_ms}ms, jitter: ${data.voice.avg_jitter_ms}ms, loss: ${data.voice.packet_loss_percent}%)\n`;
+              log += '  Video: ' + data.video.quality + '\n';
+              log += '  Voice: ' + data.voice.call_quality + '\n';
             }
             
-            logContent += '\n';
-            
-            fs.appendFileSync('benchmark.log', logContent);
-            
-            console.log('Benchmark complete!');
+            log += '\n';
+            fs.appendFileSync('benchmark.log', log);
+            console.log('Done');
           }
           
           runBenchmark().catch(console.error);
@@ -238,29 +226,24 @@ Commit: ${process.env.GITHUB_SHA || 'unknown'}
         run: |
           node << 'EOF'
           const fs = require('fs');
-          
-          if (!fs.existsSync('benchmark.log')) {
-            console.log('No benchmark.log found');
-            process.exit(0);
-          }
-          
+          if (!fs.existsSync('benchmark.log')) process.exit(0);
           const content = fs.readFileSync('benchmark.log', 'utf8');
-          const separator = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
-          const entries = content.split(separator).filter(e => e.trim().length > 0);
-          
-          console.log(`Total entries: ${entries.length}`);
-          
+          const sep = '=' + '='.repeat(75);
+          const entries = content.split(sep).filter(e => e.trim());
+          console.log('Entries: ' + entries.length);
           if (entries.length > 10) {
             const keep = entries.slice(-10);
-            const newContent = keep.map(e => separator + e).join('');
-            fs.writeFileSync('benchmark.log', newContent);
-            console.log(`Purged ${entries.length - 10} old entries`);
+            fs.writeFileSync('benchmark.log', keep.map(e => sep + e).join(''));
+            console.log('Purged ' + (entries.length - 10));
           }
           EOF
       
       - name: Commit Results
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name github-actions[bot]
+          git config user.email github-actions[bot]@users.noreply.github.com
           git add benchmark.log
-          git diff --staged --quiet || git commit -m "benchmark [skip ci]" && git push
+          if ! git diff --staged --quiet; then
+            git commit -m "benchmark [skip ci]"
+            git push
+          fi
