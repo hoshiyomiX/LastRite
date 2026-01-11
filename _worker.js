@@ -1366,7 +1366,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         safeCloseWebSocket(webSocketServer);
         if (readableStreamCancel) {
           return;
-        ;
+        }
         controller.close();
       });
       webSocketServer.addEventListener("error", (err) => {
