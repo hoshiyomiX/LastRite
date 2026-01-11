@@ -118,6 +118,14 @@ const CORS_HEADER_OPTIONS = {
 // Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
 
+// Helper to add comprehensive cache headers
+function addCacheHeaders(headers, ttl = 3600, browserTTL = 1800) {
+  headers["Cache-Control"] = `public, max-age=${browserTTL}, s-maxage=${ttl}`;
+  headers["CDN-Cache-Control"] = `public, max-age=${ttl}`;
+  headers["Cloudflare-CDN-Cache-Control"] = `max-age=${ttl}`;
+  headers["Vary"] = "Accept-Encoding";
+}
+
 // OPTIMIZATION 17: Request deduplication helpers
 function getRequestKey(request) {
   const url = new URL(request.url);
@@ -726,7 +734,8 @@ export default {
               // OPTIMIZATION 11: Use streaming for raw and v2ray formats
               if (filterFormat === "raw") {
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                // PATCH 2: Enhanced cache headers
+                addCacheHeaders(responseHeaders, 3600, 1800);
                 
                 const configStream = generateConfigsStream(
                   prxList, filterPort, filterVPN, filterLimit, 
@@ -749,7 +758,8 @@ export default {
                 
                 const finalResult = btoa(result.join("\n"));
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-                responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                // PATCH 2: Enhanced cache headers
+                addCacheHeaders(responseHeaders, 3600, 1800);
                 
                 return new Response(finalResult, {
                   status: 200,
@@ -796,7 +806,8 @@ export default {
                   const finalResult = await res.text();
                   const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
                   responseHeaders["Content-Type"] = contentType;
-                  responseHeaders["Cache-Control"] = "public, max-age=1800, s-maxage=3600";
+                  // PATCH 2: Enhanced cache headers
+                  addCacheHeaders(responseHeaders, 3600, 1800);
                   
                   return new Response(finalResult, {
                     status: 200,
