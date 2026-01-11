@@ -1,15 +1,15 @@
-name: Network Benchmark
+name: Network Benchmark (Advanced)
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/30 * * * *'  # Every 30 minutes
   workflow_dispatch:
 
 jobs:
   benchmark:
-    name: Network Performance Test
+    name: Advanced Performance Test
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     
     steps:
       - name: Checkout
@@ -22,13 +22,15 @@ jobs:
         with:
           node-version: '20'
       
-      - name: Run Benchmark Tests
+      - name: Run Advanced Benchmark
         run: |
           node << 'EOF'
           const https = require('https');
           const http = require('http');
+          const dns = require('dns').promises;
           const fs = require('fs');
           
+          // Domains from wrangler.toml
           const DOMAINS = [
             'hoshiyomi.qzz.io',
             'hoshiyomi.web.id',
@@ -36,215 +38,329 @@ jobs:
             'api24-normal.tiktokv.com.hoshiyomi.qzz.io'
           ];
           
-          function request(url) {
+          // Advanced HTTP request with detailed timing
+          function advancedRequest(url) {
             return new Promise((resolve, reject) => {
               const protocol = url.startsWith('https') ? https : http;
-              const start = Date.now();
+              const urlObj = new URL(url);
               
-              protocol.get(url, (res) => {
-                let data = '';
-                let size = 0;
+              const timing = {
+                dnsStart: 0, dnsEnd: 0, tcpStart: 0, tcpEnd: 0,
+                tlsStart: 0, tlsEnd: 0, ttfb: 0, transferStart: 0, transferEnd: 0,
+              };
+              
+              const dnsStart = Date.now();
+              dns.lookup(urlObj.hostname).then(() => {
+                timing.dnsEnd = Date.now();
+                timing.dnsStart = dnsStart;
+                timing.tcpStart = Date.now();
                 
-                res.on('data', chunk => {
-                  data += chunk;
-                  size += chunk.length;
+                const req = protocol.get(url, (res) => {
+                  timing.tcpEnd = Date.now();
+                  timing.ttfb = Date.now();
+                  timing.transferStart = Date.now();
+                  
+                  let data = '';
+                  let size = 0;
+                  const chunks = [];
+                  const chunkTimings = [];
+                  
+                  res.on('data', chunk => {
+                    const chunkReceived = Date.now();
+                    data += chunk;
+                    size += chunk.length;
+                    chunks.push(chunk.length);
+                    chunkTimings.push({ size: chunk.length, timestamp: chunkReceived - timing.transferStart });
+                  });
+                  
+                  res.on('end', () => {
+                    timing.transferEnd = Date.now();
+                    resolve({ 
+                      timing, size, data, status: res.statusCode,
+                      headers: Object.fromEntries(Object.entries(res.headers)),
+                      chunks, chunkTimings,
+                      metrics: {
+                        dnsTime: timing.dnsEnd - timing.dnsStart,
+                        tcpTime: timing.tcpEnd - timing.tcpStart,
+                        ttfb: timing.ttfb - timing.tcpStart,
+                        transferTime: timing.transferEnd - timing.transferStart,
+                        totalTime: timing.transferEnd - dnsStart,
+                      }
+                    });
+                  });
                 });
                 
-                res.on('end', () => {
-                  const duration = Date.now() - start;
-                  resolve({ duration, size, data, status: res.statusCode });
-                });
-              }).on('error', reject);
+                req.on('error', reject);
+                
+                // TLS timing (for HTTPS)
+                if (protocol === https) {
+                  req.on('socket', (socket) => {
+                    socket.on('secureConnect', () => {
+                      timing.tlsStart = timing.tcpEnd;
+                      timing.tlsEnd = Date.now();
+                    });
+                  });
+                }
+              }).catch(reject);
             });
           }
           
-          async function testPing(domain) {
-            const results = [];
+          // Test 1: ADVANCED PING - Latency breakdown
+          async function advancedPing(domain) {
+            const samples = [], errors = [];
             
             for (let i = 0; i < 10; i++) {
               try {
-                const { duration } = await request(`https://${domain}/api/v1/myip`);
-                results.push(duration);
-              } catch (err) {
-                results.push(-1);
-              }
+                const result = await advancedRequest(`https://${domain}/api/v1/myip`);
+                samples.push({
+                  total: result.metrics.totalTime,
+                  dns: result.metrics.dnsTime,
+                  tcp: result.metrics.tcpTime,
+                  ttfb: result.metrics.ttfb,
+                });
+              } catch (err) { errors.push(err.message); }
+              await new Promise(r => setTimeout(r, 50));
             }
             
-            const valid = results.filter(r => r > 0);
-            const avg = valid.length > 0 ? Math.round(valid.reduce((a,b) => a+b, 0) / valid.length) : -1;
+            if (samples.length === 0) return { error: 'All ping failed', errors, samples: 0 };
             
-            return { avg_latency_ms: avg, samples: valid.length };
-          }
-          
-          async function testDownload(domain) {
-            try {
-              const { duration, size } = await request(
-                `https://${domain}/api/v1/sub?cc=US,SG,JP&limit=100&format=raw`
-              );
-              
-              const sizeKB = (size / 1024).toFixed(2);
-              const speedKBs = ((size / 1024) / (duration / 1000)).toFixed(2);
-              
-              return {
-                size_kb: parseFloat(sizeKB),
-                speed_kbs: parseFloat(speedKBs),
-                duration_ms: duration
-              };
-            } catch (err) {
-              return { error: err.message };
-            }
-          }
-          
-          async function testVideoStream(domain) {
-            const chunks = 5;
-            let successChunks = 0;
-            let totalTime = 0;
-            let bufferStalls = 0;
+            const totals = samples.map(s => s.total).sort((a,b) => a-b);
+            const dns = samples.map(s => s.dns).sort((a,b) => a-b);
+            const tcp = samples.map(s => s.tcp).sort((a,b) => a-b);
+            const ttfb = samples.map(s => s.ttfb).sort((a,b) => a-b);
             
-            for (let i = 0; i < chunks; i++) {
-              try {
-                const { duration } = await request(
-                  `https://${domain}/api/v1/sub?cc=US&limit=50`
-                );
-                
-                totalTime += duration;
-                successChunks++;
-                
-                if (duration > 2000) bufferStalls++;
-                
-                await new Promise(r => setTimeout(r, 100));
-              } catch (err) {
-                // Skip
-              }
-            }
-            
-            const avgChunkTime = successChunks > 0 ? Math.round(totalTime / successChunks) : -1;
-            const quality = bufferStalls === 0 ? 'smooth' : bufferStalls <= 1 ? 'acceptable' : 'poor';
+            const percentile = (arr, p) => arr[Math.floor(arr.length * p)] || arr[arr.length - 1];
+            const avg = arr => arr.reduce((a,b) => a+b, 0) / arr.length;
+            const stddev = arr => {
+              const mean = avg(arr);
+              return Math.sqrt(arr.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / arr.length);
+            };
             
             return {
-              avg_chunk_time_ms: avgChunkTime,
-              buffer_stalls: bufferStalls,
-              quality: quality,
-              success_rate: ((successChunks / chunks) * 100).toFixed(2)
+              samples: samples.length, errors: errors.length,
+              latency: {
+                avg: Math.round(avg(totals)), p50: Math.round(percentile(totals, 0.5)),
+                p95: Math.round(percentile(totals, 0.95)), p99: Math.round(percentile(totals, 0.99)),
+                jitter: Math.round(stddev(totals)),
+              },
+              breakdown: {
+                dns: Math.round(avg(dns)), tcp: Math.round(avg(tcp)), ttfb: Math.round(avg(ttfb)),
+              },
             };
           }
           
-          async function testVoiceCall(domain) {
-            const packets = 30;
-            const interval = 100;
+          // Test 2: ADVANCED DOWNLOAD - Speed & cache
+          async function advancedDownload(domain) {
+            const results = [];
             
-            let successPackets = 0;
-            let latencies = [];
-            let jitter = [];
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                const result = await advancedRequest(`https://${domain}/api/v1/sub?cc=US,SG&limit=100&format=raw`);
+                const sizeKB = (result.size / 1024).toFixed(2);
+                const speedKBs = ((result.size / 1024) / (result.metrics.transferTime / 1000)).toFixed(2);
+                
+                results.push({
+                  speed_kbs: parseFloat(speedKBs), ttfb_ms: result.metrics.ttfb,
+                  cache_status: result.headers['x-cache-status'] || 'UNKNOWN',
+                  dedup_stats: result.headers['x-dedup-stats'] || 'none',
+                });
+              } catch (err) { results.push({ error: err.message }); }
+              await new Promise(r => setTimeout(r, 100));
+            }
+            
+            const cacheHits = results.filter(r => r.cache_status === 'HIT').length;
+            const cacheMisses = results.filter(r => r.cache_status === 'MISS').length;
+            const validResults = results.filter(r => !r.error);
+            if (validResults.length === 0) return { error: 'All failed', results };
+            
+            const avgSpeed = validResults.reduce((sum, r) => sum + r.speed_kbs, 0) / validResults.length;
+            const avgTTFB = validResults.reduce((sum, r) => sum + r.ttfb_ms, 0) / validResults.length;
+            
+            return {
+              avg_speed_kbs: avgSpeed.toFixed(2), avg_ttfb_ms: Math.round(avgTTFB),
+              cache: { hits: cacheHits, misses: cacheMisses },
+              results: results.map(r => ({ speed: r.speed_kbs, cache: r.cache_status })),
+            };
+          }
+          
+          // Test 3: ADVANCED VIDEO - Buffer analysis
+          async function advancedVideoStream(domain) {
+            const chunks = 8, chunkResults = [], stallEvents = [];
+            
+            for (let i = 0; i < chunks; i++) {
+              try {
+                const start = Date.now();
+                const result = await advancedRequest(`https://${domain}/api/v1/sub?cc=US&limit=50`);
+                const duration = Date.now() - start;
+                const isStall = duration > 2000;
+                
+                chunkResults.push({ chunk: i + 1, duration_ms: duration, is_stall: isStall });
+                if (isStall) stallEvents.push({ chunk: i + 1, duration_ms: duration });
+                await new Promise(r => setTimeout(r, 100));
+              } catch (err) { chunkResults.push({ chunk: i + 1, error: err.message }); }
+            }
+            
+            const successChunks = chunkResults.filter(c => !c.error);
+            if (successChunks.length === 0) return { error: 'All failed', chunks: chunkResults };
+            
+            const durations = successChunks.map(c => c.duration_ms);
+            const avgDuration = durations.reduce((a,b) => a+b, 0) / durations.length;
+            const quality = stallEvents.length === 0 ? 'excellent' : stallEvents.length <= 1 ? 'good' :
+                           stallEvents.length <= 2 ? 'acceptable' : 'poor';
+            
+            return {
+              total: chunks, success: successChunks.length, avg_chunk_ms: Math.round(avgDuration),
+              stalls: { count: stallEvents.length, events: stallEvents },
+              quality: quality,
+            };
+          }
+          
+          // Test 4: ADVANCED VOICE - Stability
+          async function advancedVoiceCall(domain) {
+            const packets = 40, interval = 100, packetResults = [];
+            let latencies = [], jitterSamples = [], burstLosses = [], currentBurst = 0;
             
             for (let i = 0; i < packets; i++) {
               try {
-                const { duration } = await request(`https://${domain}/api/v1/myip`);
-                
-                latencies.push(duration);
-                successPackets++;
-                
+                const start = Date.now();
+                await advancedRequest(`https://${domain}/api/v1/myip`);
+                const latency = Date.now() - start;
+                latencies.push(latency);
                 if (latencies.length > 1) {
-                  const prevLatency = latencies[latencies.length - 2];
-                  jitter.push(Math.abs(duration - prevLatency));
+                  jitterSamples.push(Math.abs(latency - latencies[latencies.length - 2]));
                 }
-                
-                await new Promise(r => setTimeout(r, interval));
+                packetResults.push({ packet: i + 1, latency_ms: latency, status: 'success' });
+                currentBurst = 0;
               } catch (err) {
-                // Dropped
+                packetResults.push({ packet: i + 1, status: 'dropped' });
+                currentBurst++;
+                if (currentBurst >= 2) burstLosses.push({ start: i - currentBurst + 1, length: currentBurst });
               }
+              await new Promise(r => setTimeout(r, interval));
             }
             
-            const avgLatency = latencies.length > 0 ? Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length) : -1;
-            const maxLatency = latencies.length > 0 ? Math.max(...latencies) : -1;
-            const avgJitter = jitter.length > 0 ? Math.round(jitter.reduce((a,b) => a+b, 0) / jitter.length) : -1;
+            const successPackets = packetResults.filter(p => p.status === 'success').length;
             const packetLoss = ((packets - successPackets) / packets * 100).toFixed(2);
+            if (latencies.length === 0) return { error: 'All dropped', packets: packetResults };
+            
+            const sortedLatencies = [...latencies].sort((a,b) => a-b);
+            const avgLatency = Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length);
+            const p95Latency = sortedLatencies[Math.floor(sortedLatencies.length * 0.95)];
+            const avgJitter = jitterSamples.length > 0 ? Math.round(jitterSamples.reduce((a,b) => a+b, 0) / jitterSamples.length) : 0;
+            const maxJitter = jitterSamples.length > 0 ? Math.max(...jitterSamples) : 0;
             
             let callQuality;
-            if (avgLatency < 150 && avgJitter < 30 && parseFloat(packetLoss) < 1) {
+            const lossRate = parseFloat(packetLoss);
+            if (avgLatency < 150 && avgJitter < 30 && lossRate < 1 && burstLosses.length === 0) {
               callQuality = 'excellent';
-            } else if (avgLatency < 300 && avgJitter < 50 && parseFloat(packetLoss) < 3) {
+            } else if (avgLatency < 300 && avgJitter < 50 && lossRate < 3) {
               callQuality = 'good';
-            } else if (avgLatency < 400 && parseFloat(packetLoss) < 5) {
+            } else if (avgLatency < 400 && lossRate < 5) {
               callQuality = 'acceptable';
             } else {
               callQuality = 'poor';
             }
             
             return {
-              avg_latency_ms: avgLatency,
-              max_latency_ms: maxLatency,
-              avg_jitter_ms: avgJitter,
-              packet_loss_percent: parseFloat(packetLoss),
-              call_quality: callQuality
+              total: packets, success: successPackets, packet_loss_percent: parseFloat(packetLoss),
+              latency: { avg: avgLatency, p95: p95Latency },
+              jitter: { avg_ms: avgJitter, max_ms: Math.round(maxJitter) },
+              burst_loss: burstLosses.length,
+              call_quality: callQuality,
             };
           }
           
-          async function runBenchmark() {
-            console.log('Starting benchmark');
-            
+          // Main runner
+          async function runAdvancedBenchmark() {
+            console.log('\nADVANCED BENCHMARK\n' + '='.repeat(60));
             const results = {};
             
             for (const domain of DOMAINS) {
-              console.log(`Testing ${domain}`);
-              const ping = await testPing(domain);
-              const download = await testDownload(domain);
-              const video = await testVideoStream(domain);
-              const voice = await testVoiceCall(domain);
+              console.log(`\nTesting ${domain}...`);
+              const ping = await advancedPing(domain);
+              const download = await advancedDownload(domain);
+              const video = await advancedVideoStream(domain);
+              const voice = await advancedVoiceCall(domain);
               results[domain] = { ping, download, video, voice };
             }
             
             const timestamp = new Date().toISOString();
             let log = '\n' + '='.repeat(76) + '\n';
-            log += 'BENCHMARK RESULTS\n';
+            log += 'ADVANCED BENCHMARK RESULTS\n';
             log += 'Timestamp: ' + timestamp + '\n';
+            log += 'Commit: ' + (process.env.GITHUB_SHA || 'unknown') + '\n';
             log += '='.repeat(76) + '\n';
             
             for (const [domain, data] of Object.entries(results)) {
-              log += '\nDomain: ' + domain + '\n';
-              log += '  Ping: ' + data.ping.avg_latency_ms + 'ms\n';
+              log += '\n' + domain + '\n';
               
-              if (data.download.error) {
-                log += '  Download: ERROR\n';
+              const p = data.ping;
+              if (p.error) {
+                log += '  PING: ERROR - ' + p.error + '\n';
               } else {
-                log += '  Download: ' + data.download.speed_kbs + ' KB/s\n';
+                log += '  PING: avg=' + p.latency.avg + 'ms p95=' + p.latency.p95 + 'ms jitter=' + p.latency.jitter + 'ms\n';
+                log += '        breakdown: DNS=' + p.breakdown.dns + 'ms TCP=' + p.breakdown.tcp + 'ms TTFB=' + p.breakdown.ttfb + 'ms\n';
               }
               
-              log += '  Video: ' + data.video.quality + '\n';
-              log += '  Voice: ' + data.voice.call_quality + '\n';
+              const d = data.download;
+              if (d.error) {
+                log += '  DOWNLOAD: ERROR\n';
+              } else {
+                log += '  DOWNLOAD: ' + d.avg_speed_kbs + ' KB/s | TTFB=' + d.avg_ttfb_ms + 'ms\n';
+                log += '            cache: ' + d.cache.hits + ' hits, ' + d.cache.misses + ' misses\n';
+              }
+              
+              const v = data.video;
+              if (v.error) {
+                log += '  VIDEO: ERROR\n';
+              } else {
+                log += '  VIDEO: ' + v.quality.toUpperCase() + ' | avg_chunk=' + v.avg_chunk_ms + 'ms stalls=' + v.stalls.count + '\n';
+                if (v.stalls.count > 0) {
+                  log += '         stall_events: ' + v.stalls.events.map(e => 'chunk' + e.chunk + ':' + e.duration_ms + 'ms').join(', ') + '\n';
+                }
+              }
+              
+              const vo = data.voice;
+              if (vo.error) {
+                log += '  VOICE: ERROR\n';
+              } else {
+                log += '  VOICE: ' + vo.call_quality.toUpperCase() + ' | latency=' + vo.latency.avg + 'ms(' + vo.latency.p95 + 'p95) jitter=' + vo.jitter.avg_ms + 'ms\n';
+                log += '         packet_loss=' + vo.packet_loss_percent + '% burst_events=' + vo.burst_loss + ' success=' + vo.success + '/' + vo.total + '\n';
+              }
             }
             
             log += '\n';
             fs.appendFileSync('benchmark.log', log);
-            console.log('Done');
+            console.log('\nDone! Results appended to benchmark.log');
           }
           
-          runBenchmark().catch(console.error);
+          runAdvancedBenchmark().catch(console.error);
           EOF
       
-      - name: Purge Old Entries
+      - name: Purge Old Entries (Keep Last 10)
         run: |
           node << 'EOF'
           const fs = require('fs');
-          if (!fs.existsSync('benchmark.log')) process.exit(0);
+          if (!fs.existsSync('benchmark.log')) { console.log('No log found'); process.exit(0); }
           const content = fs.readFileSync('benchmark.log', 'utf8');
           const sep = '=' + '='.repeat(75);
-          const entries = content.split(sep).filter(e => e.trim());
-          console.log('Entries: ' + entries.length);
+          const entries = content.split(sep).filter(e => e.trim().length > 0);
+          console.log('Total entries: ' + entries.length);
           if (entries.length > 10) {
             const keep = entries.slice(-10);
             fs.writeFileSync('benchmark.log', keep.map(e => sep + e).join(''));
-            console.log('Purged ' + (entries.length - 10));
+            console.log('Purged ' + (entries.length - 10) + ' old entries');
+          } else {
+            console.log('No purge needed');
           }
           EOF
       
       - name: Commit Results
         run: |
-          git config user.name github-actions[bot]
-          git config user.email github-actions[bot]@users.noreply.github.com
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add benchmark.log
           if ! git diff --staged --quiet; then
-            git commit -m "benchmark [skip ci]"
+            git commit -m "benchmark: $(date -u +"%Y-%m-%d %H:%M UTC") [skip ci]"
             git push
           fi
-          
