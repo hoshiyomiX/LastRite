@@ -118,3 +118,46 @@ api24-normal.tiktokv.com.hoshiyomi.qzz.io
   VOICE: EXCELLENT | latency=25ms(26p95) jitter=1ms
          packet_loss=0% burst_events=0 success=40/40
 
+
+============================================================================
+ADVANCED BENCHMARK RESULTS
+Timestamp: 2026-01-11T14:24:42.170Z
+Commit: 7ce57aa490a8a0a2a32a0f9f817af8108aa85fa4
+============================================================================
+
+hoshiyomi.qzz.io
+  PING: avg=802ms p95=7941ms jitter=2380ms
+        breakdown: DNS=785ms TCP=17ms TTFB=17ms
+  DOWNLOAD: 1863.94 KB/s (transfer=1ms) | TTFB=16ms
+            cache: 1 hits, 0 misses
+  VIDEO: EXCELLENT | avg_chunk=12ms stalls=0
+  VOICE: EXCELLENT | latency=8ms(12p95) jitter=1ms
+         packet_loss=0% burst_events=0 success=40/40
+
+hoshiyomi.web.id
+  PING: avg=34ms p95=281ms jitter=82ms
+        breakdown: DNS=24ms TCP=10ms TTFB=10ms
+  DOWNLOAD: 1879.56 KB/s (transfer=1ms) | TTFB=19ms
+            cache: 1 hits, 0 misses
+  VIDEO: EXCELLENT | avg_chunk=9ms stalls=0
+  VOICE: EXCELLENT | latency=7ms(9p95) jitter=1ms
+         packet_loss=0% burst_events=0 success=40/40
+
+belajar.ruangguru.com.hoshiyomi.qzz.io
+  PING: avg=400ms p95=3932ms jitter=1177ms
+        breakdown: DNS=390ms TCP=10ms TTFB=10ms
+  DOWNLOAD: 2263.68 KB/s (transfer=1ms) | TTFB=14ms
+            cache: 1 hits, 0 misses
+  VIDEO: EXCELLENT | avg_chunk=9ms stalls=0
+  VOICE: EXCELLENT | latency=8ms(13p95) jitter=1ms
+         packet_loss=0% burst_events=0 success=40/40
+
+api24-normal.tiktokv.com.hoshiyomi.qzz.io
+  PING: avg=387ms p95=3795ms jitter=1136ms
+        breakdown: DNS=378ms TCP=9ms TTFB=9ms
+  DOWNLOAD: 15.63 KB/s (transfer=1ms) | TTFB=7ms
+            cache: 0 hits, 0 misses
+  VIDEO: EXCELLENT | avg_chunk=9ms stalls=0
+  VOICE: EXCELLENT | latency=9ms(16p95) jitter=2ms
+         packet_loss=0% burst_events=0 success=40/40
+
