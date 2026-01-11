@@ -1,0 +1,270 @@
+name: Network Benchmark
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: Network Performance Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: testing
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Run Benchmark Tests
+        run: |
+          node << 'EOF'
+          const https = require('https');
+          const http = require('http');
+          const fs = require('fs');
+          
+          // Domains from wrangler.toml
+          const DOMAINS = [
+            'hoshiyomi.qzz.io',
+            'hoshiyomi.web.id',
+            'belajar.ruangguru.com.hoshiyomi.qzz.io',
+            'api24-normal.tiktokv.com.hoshiyomi.qzz.io'
+          ];
+          
+          // Helper: HTTP request wrapper
+          function request(url) {
+            return new Promise((resolve, reject) => {
+              const protocol = url.startsWith('https') ? https : http;
+              const start = Date.now();
+              
+              protocol.get(url, (res) => {
+                let data = '';
+                let size = 0;
+                
+                res.on('data', chunk => {
+                  data += chunk;
+                  size += chunk.length;
+                });
+                
+                res.on('end', () => {
+                  const duration = Date.now() - start;
+                  resolve({ duration, size, data, status: res.statusCode });
+                });
+              }).on('error', reject);
+            });
+          }
+          
+          // Test 1: Ping (Latency)
+          async function testPing(domain) {
+            const results = [];
+            
+            for (let i = 0; i < 10; i++) {
+              try {
+                const { duration } = await request(`https://${domain}/api/v1/myip`);
+                results.push(duration);
+              } catch (err) {
+                results.push(-1);
+              }
+            }
+            
+            const valid = results.filter(r => r > 0);
+            const avg = valid.length > 0 ? Math.round(valid.reduce((a,b) => a+b, 0) / valid.length) : -1;
+            
+            return { avg_latency_ms: avg, samples: valid.length };
+          }
+          
+          // Test 2: Download Speed
+          async function testDownload(domain) {
+            try {
+              const { duration, size } = await request(
+                `https://${domain}/api/v1/sub?cc=US,SG,JP&limit=100&format=raw`
+              );
+              
+              const sizeKB = (size / 1024).toFixed(2);
+              const speedKBs = ((size / 1024) / (duration / 1000)).toFixed(2);
+              
+              return {
+                size_kb: parseFloat(sizeKB),
+                speed_kbs: parseFloat(speedKBs),
+                duration_ms: duration
+              };
+            } catch (err) {
+              return { error: err.message };
+            }
+          }
+          
+          // Test 3: Video Stream (chunk loading)
+          async function testVideoStream(domain) {
+            const chunks = 5;
+            let successChunks = 0;
+            let totalTime = 0;
+            let bufferStalls = 0;
+            
+            for (let i = 0; i < chunks; i++) {
+              try {
+                const { duration } = await request(
+                  `https://${domain}/api/v1/sub?cc=US&limit=50`
+                );
+                
+                totalTime += duration;
+                successChunks++;
+                
+                if (duration > 2000) bufferStalls++;
+                
+                // Simulate playback interval
+                await new Promise(r => setTimeout(r, 100));
+              } catch (err) {
+                // Skip failed chunk
+              }
+            }
+            
+            const avgChunkTime = successChunks > 0 ? Math.round(totalTime / successChunks) : -1;
+            const quality = bufferStalls === 0 ? 'smooth' : 
+                           bufferStalls <= 1 ? 'acceptable' : 'poor';
+            
+            return {
+              avg_chunk_time_ms: avgChunkTime,
+              buffer_stalls: bufferStalls,
+              quality: quality,
+              success_rate: ((successChunks / chunks) * 100).toFixed(2)
+            };
+          }
+          
+          // Test 4: Voice Call (packet simulation)
+          async function testVoiceCall(domain) {
+            const packets = 30;
+            const interval = 100;
+            
+            let successPackets = 0;
+            let latencies = [];
+            let jitter = [];
+            
+            for (let i = 0; i < packets; i++) {
+              try {
+                const { duration } = await request(`https://${domain}/api/v1/myip`);
+                
+                latencies.push(duration);
+                successPackets++;
+                
+                if (latencies.length > 1) {
+                  const prevLatency = latencies[latencies.length - 2];
+                  jitter.push(Math.abs(duration - prevLatency));
+                }
+                
+                await new Promise(r => setTimeout(r, interval));
+              } catch (err) {
+                // Packet dropped
+              }
+            }
+            
+            const avgLatency = latencies.length > 0 ? 
+              Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length) : -1;
+            const maxLatency = latencies.length > 0 ? Math.max(...latencies) : -1;
+            const avgJitter = jitter.length > 0 ? 
+              Math.round(jitter.reduce((a,b) => a+b, 0) / jitter.length) : -1;
+            const packetLoss = ((packets - successPackets) / packets * 100).toFixed(2);
+            
+            // Quality assessment (ITU-T G.114)
+            let callQuality;
+            if (avgLatency < 150 && avgJitter < 30 && parseFloat(packetLoss) < 1) {
+              callQuality = 'excellent';
+            } else if (avgLatency < 300 && avgJitter < 50 && parseFloat(packetLoss) < 3) {
+              callQuality = 'good';
+            } else if (avgLatency < 400 && parseFloat(packetLoss) < 5) {
+              callQuality = 'acceptable';
+            } else {
+              callQuality = 'poor';
+            }
+            
+            return {
+              avg_latency_ms: avgLatency,
+              max_latency_ms: maxLatency,
+              avg_jitter_ms: avgJitter,
+              packet_loss_percent: parseFloat(packetLoss),
+              call_quality: callQuality
+            };
+          }
+          
+          // Main benchmark runner
+          async function runBenchmark() {
+            console.log('Starting network benchmark...');
+            console.log('Testing domains from wrangler.toml\n');
+            
+            const results = {};
+            
+            for (const domain of DOMAINS) {
+              console.log(`\n━━━ Testing: ${domain} ━━━`);
+              
+              console.log('  [1/4] Ping test...');
+              const ping = await testPing(domain);
+              
+              console.log('  [2/4] Download speed test...');
+              const download = await testDownload(domain);
+              
+              console.log('  [3/4] Video stream test...');
+              const video = await testVideoStream(domain);
+              
+              console.log('  [4/4] Voice call test...');
+              const voice = await testVoiceCall(domain);
+              
+              results[domain] = { ping, download, video, voice };
+            }
+            
+            // Generate report
+            const timestamp = new Date().toISOString();
+            const logEntry = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 NETWORK BENCHMARK RESULTS
+Timestamp: ${timestamp}
+Commit: ${process.env.GITHUB_SHA || 'unknown'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`;
+            
+            let logContent = logEntry;
+            
+            for (const [domain, data] of Object.entries(results)) {
+              logContent += `\n🌐 ${domain}\n`;
+              logContent += `   🏓 Ping: ${data.ping.avg_latency_ms}ms (${data.ping.samples} samples)\n`;
+              
+              if (data.download.error) {
+                logContent += `   ⬇️  Download: ERROR - ${data.download.error}\n`;
+              } else {
+                logContent += `   ⬇️  Download: ${data.download.speed_kbs} KB/s (${data.download.size_kb} KB in ${data.download.duration_ms}ms)\n`;
+              }
+              
+              logContent += `   📹 Video: ${data.video.quality} (avg chunk: ${data.video.avg_chunk_time_ms}ms, stalls: ${data.video.buffer_stalls})\n`;
+              logContent += `   📞 Voice: ${data.voice.call_quality} (latency: ${data.voice.avg_latency_ms}ms, jitter: ${data.voice.avg_jitter_ms}ms, loss: ${data.voice.packet_loss_percent}%)\n`;
+            }
+            
+            logContent += '\n';
+            
+            // Write to benchmark.log
+            fs.appendFileSync('benchmark.log', logContent);
+            
+            console.log('\n✅ Benchmark complete! Results appended to benchmark.log');
+            console.log(logContent);
+          }
+          
+          runBenchmark().catch(console.error);
+          EOF
+      
+      - name: Commit Results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add benchmark.log
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "benchmark: $(date -u +"%Y-%m-%d %H:%M UTC")
+          
+          Auto-generated by GitHub Actions
+          [skip ci]"
+            git push
+          fi
