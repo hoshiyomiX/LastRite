@@ -105,6 +105,24 @@ jobs:
             });
           }
           
+          // PATCH 3: Parse optimization stats from headers
+          function parseOptimizationHeaders(headers) {
+            const getHeader = (name) => headers[name.toLowerCase()] || '';
+            
+            return {
+              pool: getHeader('x-pool-stats'),
+              buffer: getHeader('x-buffer-stats'),
+              timeout: getHeader('x-timeout-stats'),
+              retry: getHeader('x-retry-stats'),
+              batch: getHeader('x-batch-stats'),
+              dedup: getHeader('x-dedup-stats'),
+              streaming: getHeader('x-streaming-stats'),
+              dns: getHeader('x-dns-stats'),
+              optimizations: getHeader('x-worker-optimizations'),
+              streamingMode: getHeader('x-streaming-mode'),
+            };
+          }
+          
           // Test 1: ADVANCED PING - Latency breakdown
           async function advancedPing(domain) {
             const samples = [], errors = [];
@@ -149,9 +167,10 @@ jobs:
             };
           }
           
-          // Test 2: ADVANCED DOWNLOAD - Speed & cache
+          // Test 2: ADVANCED DOWNLOAD - Speed & cache & PATCH 3 optimization metrics
           async function advancedDownload(domain) {
             const results = [];
+            let optimizationMetrics = null;
             
             for (let attempt = 0; attempt < 3; attempt++) {
               try {
@@ -162,13 +181,17 @@ jobs:
                 const transferTime = Math.max(result.metrics.transferTime, 1); // Minimum 1ms
                 const speedKBs = ((result.size / 1024) / (transferTime / 1000)).toFixed(2);
                 
+                // PATCH 3: Extract optimization headers (only once)
+                if (!optimizationMetrics) {
+                  optimizationMetrics = parseOptimizationHeaders(result.headers);
+                }
+                
                 results.push({
                   speed_kbs: parseFloat(speedKBs), 
                   ttfb_ms: result.metrics.ttfb,
                   transfer_ms: transferTime,
                   size_kb: parseFloat(sizeKB),
                   cache_status: result.headers['x-cache-status'] || 'UNKNOWN',
-                  dedup_stats: result.headers['x-dedup-stats'] || 'none',
                 });
               } catch (err) { results.push({ error: err.message }); }
               await new Promise(r => setTimeout(r, 100));
@@ -188,6 +211,7 @@ jobs:
               avg_ttfb_ms: Math.round(avgTTFB),
               avg_transfer_ms: Math.round(avgTransfer),
               cache: { hits: cacheHits, misses: cacheMisses },
+              optimizations: optimizationMetrics, // PATCH 3: Include optimization metrics
               results: results.map(r => ({ speed: r.speed_kbs, cache: r.cache_status, transfer_ms: r.transfer_ms })),
             };
           }
@@ -317,6 +341,23 @@ jobs:
               } else {
                 log += '  DOWNLOAD: ' + d.avg_speed_kbs + ' KB/s (transfer=' + d.avg_transfer_ms + 'ms) | TTFB=' + d.avg_ttfb_ms + 'ms\n';
                 log += '            cache: ' + d.cache.hits + ' hits, ' + d.cache.misses + ' misses\n';
+                
+                // PATCH 3: Log optimization metrics if available
+                if (d.optimizations && d.optimizations.optimizations) {
+                  log += '  OPTIMIZATIONS: ' + d.optimizations.optimizations + '\n';
+                  if (d.optimizations.streamingMode) {
+                    log += '    streaming: ' + d.optimizations.streamingMode;
+                    if (d.optimizations.streaming) log += ' | ' + d.optimizations.streaming;
+                    log += '\n';
+                  }
+                  if (d.optimizations.pool) log += '    pool: ' + d.optimizations.pool + '\n';
+                  if (d.optimizations.buffer) log += '    buffer: ' + d.optimizations.buffer + '\n';
+                  if (d.optimizations.timeout) log += '    timeout: ' + d.optimizations.timeout + '\n';
+                  if (d.optimizations.retry) log += '    retry: ' + d.optimizations.retry + '\n';
+                  if (d.optimizations.batch) log += '    batch: ' + d.optimizations.batch + '\n';
+                  if (d.optimizations.dedup) log += '    dedup: ' + d.optimizations.dedup + '\n';
+                  if (d.optimizations.dns) log += '    dns: ' + d.optimizations.dns + '\n';
+                }
               }
               
               const v = data.video;
