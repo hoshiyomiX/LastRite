@@ -45,6 +45,12 @@ const BUFFER_HIGH_WATERMARK = 262144; // 256KB - pause if exceeded
 const BUFFER_LOW_WATERMARK = 65536;   // 64KB - resume when below
 const CHUNK_SIZE_OPTIMAL = 65536;     // 64KB per chunk
 const MAX_QUEUE_SIZE = 512;           // Max queued chunks
+const bufferStats = {
+  backpressureEvents: 0,
+  queueOverflows: 0,
+  totalQueued: 0,
+  maxQueueDepth: 0
+};
 
 // OPTIMIZATION 14: Adaptive timeout system
 const latencyTracker = new Map(); // Track RTT per destination
@@ -72,6 +78,11 @@ const THRESHOLD_MEDIUM = 1048576;  // 1MB
 const COALESCE_THRESHOLD = 16384;  // 16KB - batch chunks smaller than this
 const COALESCE_MAX_SIZE = 131072;  // 128KB - max batched size
 const COALESCE_TIMEOUT = 5;        // 5ms - max wait for batching
+const batchStats = {
+  batched: 0,
+  unbatched: 0,
+  totalBatchSavings: 0
+};
 
 // OPTIMIZATION 16: Smart retry with exponential backoff
 const RETRY_MAX_ATTEMPTS = 3;      // Max retry attempts
@@ -93,6 +104,13 @@ const coalesceStats = {
   hits: 0,        // Requests served from pending
   misses: 0,      // Unique requests
   saved: 0        // Total duplicate requests avoided
+};
+
+// OPTIMIZATION 11: Streaming stats
+const streamingStats = {
+  activeStreams: 0,
+  totalStreamed: 0,
+  streamingBytes: 0
 };
 
 // Constant
@@ -138,6 +156,20 @@ const CORS_HEADER_OPTIONS = {
 
 // Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+
+// PATCH 3: Helper to format stats as compact string
+function formatStats() {
+  return {
+    pool: `h=${poolStats.hits} m=${poolStats.misses} e=${poolStats.evictions}`,
+    buffer: `bp=${bufferStats.backpressureEvents} qo=${bufferStats.queueOverflows} qd=${bufferStats.maxQueueDepth}`,
+    timeout: `adp=${timeoutStats.adaptive} def=${timeoutStats.default} ff=${timeoutStats.fastFail} ss=${timeoutStats.slowSuccess}`,
+    retry: `att=${retryStats.attempts} suc=${retryStats.successes} fail=${retryStats.failures}`,
+    batch: `b=${batchStats.batched} ub=${batchStats.unbatched} sav=${batchStats.totalBatchSavings}`,
+    dedup: `h=${coalesceStats.hits} m=${coalesceStats.misses} s=${coalesceStats.saved}`,
+    streaming: `act=${streamingStats.activeStreams} tot=${streamingStats.totalStreamed} bytes=${(streamingStats.streamingBytes/1024).toFixed(0)}KB`,
+    dns: `h=${dnsStats.hits} m=${dnsStats.misses} doh=${dnsStats.dohSuccess} cs=${dnsCache.size}`
+  };
+}
 
 // OPTIMIZATION 18: DNS-over-HTTPS helpers
 async function resolveDNS(hostname) {
@@ -258,10 +290,11 @@ async function fetchWithDNS(url, options = {}) {
 
 // Helper to add comprehensive cache headers
 function addCacheHeaders(headers, ttl = 3600, browserTTL = 1800) {
-  headers["Cache-Control"] = `public, max-age=${browserTTL}, s-maxage=${ttl}`;
+  headers["Cache-Control"] = `public, max-age=${browserTTL}, s-maxage=${ttl}, stale-while-revalidate=86400`;
   headers["CDN-Cache-Control"] = `public, max-age=${ttl}`;
   headers["Cloudflare-CDN-Cache-Control"] = `max-age=${ttl}`;
   headers["Vary"] = "Accept-Encoding";
+  headers["ETag"] = `"${Date.now().toString(36)}"`;
 }
 
 // OPTIMIZATION 17: Request deduplication helpers
@@ -704,6 +737,10 @@ async function handleCachedRequest(request, handler) {
 async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername) {
   let configCount = 0;
   
+  console.log(`[Streaming] Starting config generation (OPT-11 active): ${prxList.length} proxies`);
+  streamingStats.activeStreams++;
+  streamingStats.totalStreamed++;
+  
   // Create base URL once
   const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
   baseUri.searchParams.set("encryption", "none");
@@ -744,12 +781,18 @@ async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimi
         baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : APP_DOMAIN);
         baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
         
+        const configStr = baseUri.toString();
+        streamingStats.streamingBytes += configStr.length;
+        
         // Yield each config as it's generated
-        yield baseUri.toString();
+        yield configStr;
         configCount++;
       }
     }
   }
+  
+  streamingStats.activeStreams--;
+  console.log(`[Streaming] Completed: ${configCount} configs, ${(streamingStats.streamingBytes/1024).toFixed(2)}KB total`);
 }
 
 function createStreamingResponse(asyncGenerator, responseHeaders, filterFormat) {
@@ -866,14 +909,25 @@ export default {
               const uuid = crypto.randomUUID();
               const ssUsername = btoa(`none:${uuid}`);
               
+              // PATCH 3: Comprehensive stats in response headers
+              const stats = formatStats();
               const responseHeaders = {
                 ...CORS_HEADER_OPTIONS,
                 "X-Pagination-Offset": offset.toString(),
                 "X-Pagination-Limit": filterLimit.toString(),
                 "X-Pagination-Total": pagination.total.toString(),
                 "X-Pagination-Has-More": pagination.hasMore.toString(),
-                "X-Dedup-Stats": `hits=${coalesceStats.hits} misses=${coalesceStats.misses} saved=${coalesceStats.saved}`,
-                "X-DNS-Stats": `hits=${dnsStats.hits} misses=${dnsStats.misses} doh=${dnsStats.dohSuccess} cache_size=${dnsCache.size}`,
+                
+                // PATCH 3: Full optimization metrics
+                "X-Pool-Stats": stats.pool,
+                "X-Buffer-Stats": stats.buffer,
+                "X-Timeout-Stats": stats.timeout,
+                "X-Retry-Stats": stats.retry,
+                "X-Batch-Stats": stats.batch,
+                "X-Dedup-Stats": stats.dedup,
+                "X-Streaming-Stats": stats.streaming,
+                "X-DNS-Stats": stats.dns,
+                "X-Worker-Optimizations": "OPT11-18-ACTIVE",
               };
 
               if (pagination.nextOffset !== null) {
@@ -883,7 +937,8 @@ export default {
               // OPTIMIZATION 11: Use streaming for raw and v2ray formats
               if (filterFormat === "raw") {
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-                // PATCH 2: Enhanced cache headers
+                responseHeaders["X-Streaming-Mode"] = "ACTIVE";
+                // PATCH 2 & 3: Enhanced cache headers with ETag
                 addCacheHeaders(responseHeaders, 3600, 1800);
                 
                 const configStream = generateConfigsStream(
@@ -907,7 +962,8 @@ export default {
                 
                 const finalResult = btoa(result.join("\n"));
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
-                // PATCH 2: Enhanced cache headers
+                responseHeaders["X-Streaming-Mode"] = "BUFFERED";
+                // PATCH 2 & 3: Enhanced cache headers with ETag
                 addCacheHeaders(responseHeaders, 3600, 1800);
                 
                 return new Response(finalResult, {
@@ -955,7 +1011,8 @@ export default {
                   const finalResult = await res.text();
                   const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
                   responseHeaders["Content-Type"] = contentType;
-                  // PATCH 2: Enhanced cache headers
+                  responseHeaders["X-Streaming-Mode"] = "CONVERTER";
+                  // PATCH 2 & 3: Enhanced cache headers with ETag
                   addCacheHeaders(responseHeaders, 3600, 1800);
                   
                   return new Response(finalResult, {
@@ -1314,6 +1371,7 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
           if (webSocket.readyState === WS_READY_STATE_OPEN) {
             // OPTIMIZATION 13: Check buffer before sending
             while (webSocket.bufferedAmount > BUFFER_HIGH_WATERMARK) {
+              bufferStats.backpressureEvents++;
               await new Promise(resolve => setTimeout(resolve, 10));
               if (webSocket.readyState !== WS_READY_STATE_OPEN) {
                 return;
@@ -1631,6 +1689,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     if (batchBuffer.length === 1) {
       // Single chunk, no need to combine
       combined = batchBuffer[0];
+      batchStats.unbatched++;
     } else {
       // Combine multiple chunks
       const totalSize = batchBuffer.reduce((sum, chunk) => sum + (chunk.byteLength || chunk.length), 0);
@@ -1641,9 +1700,14 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
         combined.set(arr, offset);
         offset += arr.length;
       }
+      batchStats.batched++;
+      batchStats.totalBatchSavings += batchBuffer.length - 1;
     }
     
     bufferQueue.push(combined);
+    bufferStats.totalQueued++;
+    bufferStats.maxQueueDepth = Math.max(bufferStats.maxQueueDepth, bufferQueue.length);
+    
     batchBuffer = [];
     batchSize = 0;
   };
@@ -1661,6 +1725,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
       
       // Check for backpressure
       if (webSocket.bufferedAmount > BUFFER_HIGH_WATERMARK) {
+        bufferStats.backpressureEvents++;
         isPaused = true;
         while (webSocket.bufferedAmount > BUFFER_LOW_WATERMARK) {
           await new Promise(resolve => setTimeout(resolve, 10));
@@ -1704,6 +1769,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
             
             // OPTIMIZATION 13: Queue with limit check
             if (bufferQueue.length >= MAX_QUEUE_SIZE) {
+              bufferStats.queueOverflows++;
               log(`Queue overflow, dropping old chunks`);
               bufferQueue.shift();
             }
@@ -1733,6 +1799,8 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
               // Large chunk or interactive mode: flush batch first, then send immediately
               await flushBatch();
               bufferQueue.push(dataToSend);
+              bufferStats.totalQueued++;
+              bufferStats.maxQueueDepth = Math.max(bufferStats.maxQueueDepth, bufferQueue.length);
             }
             
             await flushBuffer();
