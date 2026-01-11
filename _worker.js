@@ -13,6 +13,27 @@ const inMemoryCache = {
 };
 const CACHE_TTL = 3600000; // 1 hour in milliseconds
 
+// OPTIMIZATION 18: DNS-over-HTTPS cache
+const dnsCache = new Map(); // hostname -> { ip, timestamp }
+const DNS_CACHE_TTL = 600000; // 10 minutes in milliseconds
+const DNS_RESOLVER = "https://cloudflare-dns.com/dns-query"; // Cloudflare DoH
+const dnsStats = {
+  hits: 0,
+  misses: 0,
+  dohSuccess: 0,
+  dohFail: 0,
+  fallback: 0
+};
+
+// Known external domains for pre-warming
+const KNOWN_DOMAINS = [
+  "raw.githubusercontent.com",
+  "api.foolvpn.web.id",
+  "id1.foolvpn.web.id",
+  "foolvpn.web.id",
+  "udp-relay.hobihaus.space"
+];
+
 // OPTIMIZATION 12: Connection pooling
 const connectionPool = new Map();
 const POOL_MAX_SIZE = 20;
@@ -117,6 +138,123 @@ const CORS_HEADER_OPTIONS = {
 
 // Connection timeout constants (now dynamic via adaptive system)
 const MAX_CONFIGS_PER_REQUEST = 20; // Pagination limit
+
+// OPTIMIZATION 18: DNS-over-HTTPS helpers
+async function resolveDNS(hostname) {
+  const now = Date.now();
+  
+  // Check cache first
+  if (dnsCache.has(hostname)) {
+    const cached = dnsCache.get(hostname);
+    if (now - cached.timestamp < DNS_CACHE_TTL) {
+      dnsStats.hits++;
+      console.log(`[DNS] Cache HIT: ${hostname} -> ${cached.ip} (age: ${Math.floor((now - cached.timestamp) / 1000)}s)`);
+      return cached.ip;
+    } else {
+      // Expired, remove from cache
+      dnsCache.delete(hostname);
+    }
+  }
+  
+  dnsStats.misses++;
+  console.log(`[DNS] Cache MISS: ${hostname}, resolving via DoH...`);
+  
+  // Resolve via DNS-over-HTTPS
+  try {
+    const startTime = Date.now();
+    const dohUrl = `${DNS_RESOLVER}?name=${hostname}&type=A`;
+    
+    const response = await fetch(dohUrl, {
+      headers: {
+        'Accept': 'application/dns-json'
+      },
+      cf: {
+        cacheTtl: 600, // Cache DoH response for 10 minutes
+        cacheEverything: true
+      }
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      const resolveTime = Date.now() - startTime;
+      
+      // Extract first A record
+      if (data.Answer && data.Answer.length > 0) {
+        const ip = data.Answer.find(r => r.type === 1)?.data; // Type 1 = A record
+        
+        if (ip) {
+          dnsStats.dohSuccess++;
+          
+          // Cache the result
+          dnsCache.set(hostname, { ip, timestamp: now });
+          
+          console.log(`[DNS] DoH SUCCESS: ${hostname} -> ${ip} (${resolveTime}ms)`);
+          console.log(`[DNS] Stats: hits=${dnsStats.hits} misses=${dnsStats.misses} doh=${dnsStats.dohSuccess} fallback=${dnsStats.fallback}`);
+          
+          return ip;
+        }
+      }
+    }
+    
+    dnsStats.dohFail++;
+    console.error(`[DNS] DoH FAILED for ${hostname}, response status: ${response.status}`);
+  } catch (err) {
+    dnsStats.dohFail++;
+    console.error(`[DNS] DoH ERROR for ${hostname}:`, err.message);
+  }
+  
+  // Fallback: return hostname (browser/runtime will resolve)
+  dnsStats.fallback++;
+  console.log(`[DNS] FALLBACK to standard resolution for ${hostname}`);
+  return hostname;
+}
+
+// Pre-warm DNS cache for known domains
+async function prewarmDNS() {
+  console.log('[DNS] Pre-warming cache for known domains...');
+  const promises = KNOWN_DOMAINS.map(domain => 
+    resolveDNS(domain).catch(err => {
+      console.error(`[DNS] Pre-warm failed for ${domain}:`, err);
+    })
+  );
+  await Promise.allSettled(promises);
+  console.log(`[DNS] Pre-warm complete. Cache size: ${dnsCache.size}`);
+}
+
+// Cleanup old DNS cache entries
+function cleanupDNSCache() {
+  const now = Date.now();
+  let cleaned = 0;
+  
+  for (const [hostname, entry] of dnsCache.entries()) {
+    if (now - entry.timestamp >= DNS_CACHE_TTL) {
+      dnsCache.delete(hostname);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`[DNS] Cleaned ${cleaned} expired entries. Cache size: ${dnsCache.size}`);
+  }
+}
+
+// Enhanced fetch with DNS pre-resolution
+async function fetchWithDNS(url, options = {}) {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname;
+    
+    // Only resolve external domains (not worker's own domain)
+    if (!hostname.includes('.workers.dev') && !hostname.includes(APP_DOMAIN)) {
+      await resolveDNS(hostname);
+    }
+    
+    return await fetch(url, options);
+  } catch (err) {
+    // Fallback to standard fetch
+    return await fetch(url, options);
+  }
+}
 
 // Helper to add comprehensive cache headers
 function addCacheHeaders(headers, ttl = 3600, browserTTL = 1800) {
@@ -401,7 +539,7 @@ async function getKVPrxList(kvPrxUrl = KV_PRX_URL, env) {
   return getCachedData(
     "kvPrxList",
     async () => {
-      const kvPrx = await fetch(kvPrxUrl);
+      const kvPrx = await fetchWithDNS(kvPrxUrl); // Use DNS-optimized fetch
       if (kvPrx.status === 200) {
         return await kvPrx.json();
       }
@@ -426,7 +564,7 @@ async function getPrxListPaginated(prxBankUrl = PRX_BANK_URL, options = {}, env)
   const prxList = await getCachedData(
     "prxList",
     async () => {
-      const prxBank = await fetch(prxBankUrl);
+      const prxBank = await fetchWithDNS(prxBankUrl); // Use DNS-optimized fetch
       if (prxBank.status === 200) {
         const text = (await prxBank.text()) || "";
         const prxString = text.split("\n").filter(Boolean);
@@ -648,6 +786,16 @@ export default {
       APP_DOMAIN = url.hostname;
       serviceName = APP_DOMAIN.split(".")[0];
 
+      // OPTIMIZATION 18: Pre-warm DNS cache on first request
+      if (dnsCache.size === 0) {
+        ctx.waitUntil(prewarmDNS());
+      }
+      
+      // Periodic DNS cache cleanup
+      if (Math.random() < 0.1) { // 10% of requests trigger cleanup
+        ctx.waitUntil(Promise.resolve().then(cleanupDNSCache));
+      }
+
       const upgradeHeader = request.headers.get("Upgrade");
 
       // Handle prx client
@@ -725,6 +873,7 @@ export default {
                 "X-Pagination-Total": pagination.total.toString(),
                 "X-Pagination-Has-More": pagination.hasMore.toString(),
                 "X-Dedup-Stats": `hits=${coalesceStats.hits} misses=${coalesceStats.misses} saved=${coalesceStats.saved}`,
+                "X-DNS-Stats": `hits=${dnsStats.hits} misses=${dnsStats.misses} doh=${dnsStats.dohSuccess} cache_size=${dnsCache.size}`,
               };
 
               if (pagination.nextOffset !== null) {
@@ -778,7 +927,7 @@ export default {
                   result.push(config);
                 }
                 
-                const converterPromise = fetch(CONVERTER_URL, {
+                const converterPromise = fetchWithDNS(CONVERTER_URL, { // Use DNS-optimized fetch
                   method: "POST",
                   body: JSON.stringify({
                     url: result.join(","),
@@ -1217,7 +1366,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         safeCloseWebSocket(webSocketServer);
         if (readableStreamCancel) {
           return;
-        }
+        ;
         controller.close();
       });
       webSocketServer.addEventListener("error", (err) => {
@@ -1658,7 +1807,7 @@ function safeCloseWebSocket(socket) {
 }
 
 async function checkPrxHealth(prxIP, prxPort) {
-  const req = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${prxIP}:${prxPort}`);
+  const req = await fetchWithDNS(`${PRX_HEALTH_CHECK_API}?ip=${prxIP}:${prxPort}`); // Use DNS-optimized fetch
   return await req.json();
 }
 
