@@ -88,3 +88,33 @@ Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
   Video: smooth
   Voice: excellent
 
+
+============================================================================
+BENCHMARK RESULTS
+Timestamp: 2026-01-11T15:40:15.827Z
+============================================================================
+
+Domain: hoshiyomi.qzz.io
+  Ping: 42ms
+  Download: 52.97 KB/s
+  Video: smooth
+  Voice: excellent
+
+Domain: hoshiyomi.web.id
+  Ping: 27ms
+  Download: 73.85 KB/s
+  Video: smooth
+  Voice: excellent
+
+Domain: belajar.ruangguru.com.hoshiyomi.qzz.io
+  Ping: 448ms
+  Download: 85.94 KB/s
+  Video: smooth
+  Voice: excellent
+
+Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
+  Ping: 512ms
+  Download: 1.56 KB/s
+  Video: smooth
+  Voice: excellent
+
