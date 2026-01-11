@@ -2,7 +2,7 @@ name: Network Benchmark
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '*/30 * * * *'  # Every 30 minutes
   workflow_dispatch:
 
 jobs:
@@ -252,6 +252,36 @@ Commit: ${process.env.GITHUB_SHA || 'unknown'}
           }
           
           runBenchmark().catch(console.error);
+          EOF
+      
+      - name: Purge Old Entries (Keep Last 10)
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          
+          if (!fs.existsSync('benchmark.log')) {
+            console.log('No benchmark.log found, skipping purge');
+            process.exit(0);
+          }
+          
+          const content = fs.readFileSync('benchmark.log', 'utf8');
+          
+          // Split by separator line (━━━━...)
+          const separator = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
+          const entries = content.split(separator).filter(e => e.trim().length > 0);
+          
+          console.log(`Total entries found: ${entries.length}`);
+          
+          // Keep only last 10 entries
+          if (entries.length > 10) {
+            const keep = entries.slice(-10);
+            const newContent = keep.map(e => separator + e).join('');
+            
+            fs.writeFileSync('benchmark.log', newContent);
+            console.log(`Purged ${entries.length - 10} old entries, kept last 10`);
+          } else {
+            console.log('No purge needed, entries <= 10');
+          }
           EOF
       
       - name: Commit Results
