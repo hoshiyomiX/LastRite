@@ -157,10 +157,16 @@ jobs:
               try {
                 const result = await advancedRequest(`https://${domain}/api/v1/sub?cc=US,SG&limit=100&format=raw`);
                 const sizeKB = (result.size / 1024).toFixed(2);
-                const speedKBs = ((result.size / 1024) / (result.metrics.transferTime / 1000)).toFixed(2);
+                
+                // FIX: Prevent division by zero for very fast transfers
+                const transferTime = Math.max(result.metrics.transferTime, 1); // Minimum 1ms
+                const speedKBs = ((result.size / 1024) / (transferTime / 1000)).toFixed(2);
                 
                 results.push({
-                  speed_kbs: parseFloat(speedKBs), ttfb_ms: result.metrics.ttfb,
+                  speed_kbs: parseFloat(speedKBs), 
+                  ttfb_ms: result.metrics.ttfb,
+                  transfer_ms: transferTime,
+                  size_kb: parseFloat(sizeKB),
                   cache_status: result.headers['x-cache-status'] || 'UNKNOWN',
                   dedup_stats: result.headers['x-dedup-stats'] || 'none',
                 });
@@ -175,11 +181,14 @@ jobs:
             
             const avgSpeed = validResults.reduce((sum, r) => sum + r.speed_kbs, 0) / validResults.length;
             const avgTTFB = validResults.reduce((sum, r) => sum + r.ttfb_ms, 0) / validResults.length;
+            const avgTransfer = validResults.reduce((sum, r) => sum + r.transfer_ms, 0) / validResults.length;
             
             return {
-              avg_speed_kbs: avgSpeed.toFixed(2), avg_ttfb_ms: Math.round(avgTTFB),
+              avg_speed_kbs: avgSpeed.toFixed(2), 
+              avg_ttfb_ms: Math.round(avgTTFB),
+              avg_transfer_ms: Math.round(avgTransfer),
               cache: { hits: cacheHits, misses: cacheMisses },
-              results: results.map(r => ({ speed: r.speed_kbs, cache: r.cache_status })),
+              results: results.map(r => ({ speed: r.speed_kbs, cache: r.cache_status, transfer_ms: r.transfer_ms })),
             };
           }
           
@@ -306,7 +315,7 @@ jobs:
               if (d.error) {
                 log += '  DOWNLOAD: ERROR\n';
               } else {
-                log += '  DOWNLOAD: ' + d.avg_speed_kbs + ' KB/s | TTFB=' + d.avg_ttfb_ms + 'ms\n';
+                log += '  DOWNLOAD: ' + d.avg_speed_kbs + ' KB/s (transfer=' + d.avg_transfer_ms + 'ms) | TTFB=' + d.avg_ttfb_ms + 'ms\n';
                 log += '            cache: ' + d.cache.hits + ' hits, ' + d.cache.misses + ' misses\n';
               }
               
