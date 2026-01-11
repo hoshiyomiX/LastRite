@@ -6,6 +6,7 @@ compatibility_flags = ["nodejs_compat_v2"]
 # Custom domains
 routes = [
   { pattern = "hoshiyomi.qzz.io", custom_domain = true },
+  { pattern = "hoshiyomi.web.id", custom_domain = true },
   { pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io", custom_domain = true },
   { pattern = "api24-normal.tiktokv.com.hoshiyomi.qzz.io", custom_domain = true }
 ]
