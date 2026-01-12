@@ -1,48 +1,5 @@
 ============================================================================
 ADVANCED BENCHMARK RESULTS
-Timestamp: 2026-01-11T16:28:08.206Z
-Commit: 3352e79e9bd5a5b6e6cfc46bcd003bf03223fd99
-============================================================================
-
-hoshiyomi.qzz.io
-  PING: avg=452ms p95=4386ms jitter=1312ms
-        breakdown: DNS=426ms TCP=25ms TTFB=25ms
-  DOWNLOAD: 1867.19 KB/s (transfer=1ms) | TTFB=61ms
-            cache: 0 hits, 1 misses
-  VIDEO: EXCELLENT | avg_chunk=18ms stalls=0
-  VOICE: EXCELLENT | latency=13ms(15p95) jitter=1ms
-         packet_loss=0% burst_events=0 success=40/40
-
-hoshiyomi.web.id
-  PING: avg=47ms p95=353ms jitter=102ms
-        breakdown: DNS=30ms TCP=18ms TTFB=18ms
-  DOWNLOAD: 1832.69 KB/s (transfer=1ms) | TTFB=52ms
-            cache: 0 hits, 1 misses
-  VIDEO: EXCELLENT | avg_chunk=17ms stalls=0
-  VOICE: EXCELLENT | latency=14ms(16p95) jitter=1ms
-         packet_loss=0% burst_events=0 success=40/40
-
-belajar.ruangguru.com.hoshiyomi.qzz.io
-  PING: avg=869ms p95=8581ms jitter=2571ms
-        breakdown: DNS=853ms TCP=16ms TTFB=16ms
-  DOWNLOAD: 2317.71 KB/s (transfer=1ms) | TTFB=35ms
-            cache: 0 hits, 1 misses
-  VIDEO: EXCELLENT | avg_chunk=17ms stalls=0
-  VOICE: EXCELLENT | latency=13ms(16p95) jitter=1ms
-         packet_loss=0% burst_events=0 success=40/40
-
-api24-normal.tiktokv.com.hoshiyomi.qzz.io
-  PING: avg=478ms p95=4661ms jitter=1394ms
-        breakdown: DNS=460ms TCP=18ms TTFB=18ms
-  DOWNLOAD: 2406.58 KB/s (transfer=1ms) | TTFB=43ms
-            cache: 0 hits, 1 misses
-  VIDEO: EXCELLENT | avg_chunk=15ms stalls=0
-  VOICE: EXCELLENT | latency=13ms(17p95) jitter=1ms
-         packet_loss=0% burst_events=0 success=40/40
-
-
-============================================================================
-ADVANCED BENCHMARK RESULTS
 Timestamp: 2026-01-11T16:38:39.271Z
 Commit: d0376485afd7b4b0450f17227eaab9b3ea0a824a
 ============================================================================
@@ -263,6 +220,37 @@ api24-normal.tiktokv.com.hoshiyomi.qzz.io
 ============================================================================
 ADVANCED BENCHMARK RESULTS
 Timestamp: 2026-01-12T18:03:37.235Z
+Commit: 952097266c20f5e19cb54e01b72b51afd3adcccc
+============================================================================
+
+hoshiyomi.qzz.io
+  PING: ERROR - All ping failed
+  DOWNLOAD: ERROR
+  VIDEO: ERROR
+  VOICE: ERROR
+
+hoshiyomi.web.id
+  PING: ERROR - All ping failed
+  DOWNLOAD: ERROR
+  VIDEO: ERROR
+  VOICE: ERROR
+
+belajar.ruangguru.com.hoshiyomi.qzz.io
+  PING: ERROR - All ping failed
+  DOWNLOAD: ERROR
+  VIDEO: ERROR
+  VOICE: ERROR
+
+api24-normal.tiktokv.com.hoshiyomi.qzz.io
+  PING: ERROR - All ping failed
+  DOWNLOAD: ERROR
+  VIDEO: ERROR
+  VOICE: ERROR
+
+
+============================================================================
+ADVANCED BENCHMARK RESULTS
+Timestamp: 2026-01-12T18:25:30.365Z
 Commit: 952097266c20f5e19cb54e01b72b51afd3adcccc
 ============================================================================
 
