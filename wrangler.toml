@@ -3,12 +3,10 @@ main = "_worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat_v2"]
 
-# HIGH-PRIORITY: KV Cache for DNS + Data Persistence
-# Create namespace: wrangler kv:namespace create KV_CACHE
-# Then replace 'YOUR_KV_NAMESPACE_ID' with actual ID
+# KV Cache for DNS + Data Persistence (CONFIGURED)
 [[kv_namespaces]]
 binding = "KV_CACHE"
-id = "YOUR_KV_NAMESPACE_ID"  # Replace with actual KV namespace ID
+id = "a9f61fcc3abf48af91a5924027ee1a1a"
 
 # Custom domains
 routes = [
