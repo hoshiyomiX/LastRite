@@ -3,6 +3,13 @@ main = "_worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat_v2"]
 
+# HIGH-PRIORITY: KV Cache for DNS + Data Persistence
+# Create namespace: wrangler kv:namespace create KV_CACHE
+# Then replace 'YOUR_KV_NAMESPACE_ID' with actual ID
+[[kv_namespaces]]
+binding = "KV_CACHE"
+id = "YOUR_KV_NAMESPACE_ID"  # Replace with actual KV namespace ID
+
 # Custom domains
 routes = [
   { pattern = "hoshiyomi.qzz.io", custom_domain = true },
