@@ -1,0 +1,505 @@
+name: Apply Self-Hosted UI Patch
+
+# TEMPORARY WORKFLOW - DELETE AFTER SUCCESSFUL PATCH APPLICATION
+# Purpose: Apply self-hosted-ui.patch to _worker.js and commit to main branch
+# Location: This workflow is in MAIN branch, patch file is in TESTING branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Target branch untuk commit (main/testing)'
+        required: true
+        default: 'main'
+        type: choice
+        options:
+          - main
+          - testing
+      create_pr:
+        description: 'Create Pull Request instead of direct commit?'
+        required: true
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Dry run (test tanpa commit)'
+        required: false
+        default: false
+        type: boolean
+      apply_to_file:
+        description: 'File target untuk patch'
+        required: false
+        default: '_worker.js'
+        type: string
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: 📥 Checkout testing branch
+        uses: actions/checkout@v4
+        with:
+          ref: testing
+          fetch-depth: 0  # Full history for branch operations
+      
+      - name: 🔍 Verify patch file exists
+        run: |
+          if [ ! -f "self-hosted-ui.patch" ]; then
+            echo "❌ Error: self-hosted-ui.patch not found!"
+            exit 1
+          fi
+          echo "✅ Patch file found"
+          echo "📄 Patch file size: $(wc -c < self-hosted-ui.patch) bytes"
+      
+      - name: 🔍 Verify target file exists
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "❌ Error: $TARGET_FILE not found!"
+            exit 1
+          fi
+          echo "✅ Target file found: $TARGET_FILE"
+          echo "📄 Original size: $(wc -c < $TARGET_FILE) bytes"
+          
+          # Backup original file
+          cp "$TARGET_FILE" "${TARGET_FILE}.backup"
+          echo "💾 Backup created: ${TARGET_FILE}.backup"
+      
+      - name: 🔧 Setup Node.js for validation
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: 🎯 Parse and apply patch
+        id: apply
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          PATCH_FILE="self-hosted-ui.patch"
+          
+          echo "🔄 Starting patch application..."
+          echo "📋 Target: $TARGET_FILE"
+          echo "📦 Patch: $PATCH_FILE"
+          
+          # Create apply script
+          cat > apply_patch.js << 'EOFJS'
+          const fs = require('fs');
+          
+          const targetFile = process.argv[2];
+          const patchFile = process.argv[3];
+          
+          console.log('📖 Reading files...');
+          let workerCode = fs.readFileSync(targetFile, 'utf8');
+          const patchContent = fs.readFileSync(patchFile, 'utf8');
+          
+          console.log(`✅ Worker code: ${workerCode.length} characters`);
+          console.log(`✅ Patch content: ${patchContent.length} characters`);
+          
+          // Extract function code from patch
+          const functionMatch = patchContent.match(/function handleSubPage[\s\S]*?^function generateSubPageHTML[\s\S]*?^}\n```/m);
+          
+          if (!functionMatch) {
+            console.error('❌ Could not extract functions from patch');
+            process.exit(1);
+          }
+          
+          const newFunctions = functionMatch[0]
+            .replace(/^```javascript\n/, '')
+            .replace(/\n```$/, '')
+            .trim();
+          
+          console.log(`✅ Extracted functions: ${newFunctions.length} characters`);
+          
+          // Find insertion point (before "export default {")
+          const exportMatch = workerCode.match(/^export default \{/m);
+          if (!exportMatch) {
+            console.error('❌ Could not find "export default {" in worker code');
+            process.exit(1);
+          }
+          
+          const insertIndex = exportMatch.index;
+          console.log(`📍 Insertion point found at index: ${insertIndex}`);
+          
+          // Check if functions already exist (avoid duplicate)
+          if (workerCode.includes('function handleSubPage(')) {
+            console.log('⚠️  Functions already exist, will replace...');
+            
+            // Remove old functions
+            workerCode = workerCode.replace(
+              /\/\/ ={40,}\n\/\/ SELF-HOSTED SUB PAGE[\s\S]*?(?=^export default \{)/m,
+              ''
+            );
+          }
+          
+          // Insert new functions
+          const beforeExport = workerCode.substring(0, insertIndex);
+          const afterExport = workerCode.substring(insertIndex);
+          
+          const updatedCode = beforeExport + 
+            '// ' + '='.repeat(44) + '\n' +
+            '// SELF-HOSTED SUB PAGE WITH CONFIG GENERATOR\n' +
+            '// ' + '='.repeat(44) + '\n\n' +
+            newFunctions + '\n\n' +
+            afterExport;
+          
+          console.log(`✅ New code size: ${updatedCode.length} characters`);
+          
+          // Replace redirect logic
+          const oldPattern = /if \(url\.pathname\.startsWith\("\/sub"\)\) \{\s*return Response\.redirect\([^}]+\}/;
+          const newLogic = `if (url.pathname.startsWith("/sub")) {\n    return handleSubPage(url, env);\n  }`;
+          
+          if (oldPattern.test(updatedCode)) {
+            const finalCode = updatedCode.replace(oldPattern, newLogic);
+            console.log('✅ Replaced redirect logic');
+            
+            fs.writeFileSync(targetFile, finalCode, 'utf8');
+            console.log(`💾 Updated ${targetFile}`);
+            console.log(`📊 Final size: ${finalCode.length} characters`);
+            
+            // Write stats for GitHub Actions
+            fs.writeFileSync('patch_stats.txt', 
+              `original_size=${workerCode.length}\n` +
+              `patched_size=${finalCode.length}\n` +
+              `diff=${finalCode.length - workerCode.length}\n`
+            );
+          } else {
+            console.error('❌ Could not find redirect logic to replace');
+            console.log('🔍 Searching for: if (url.pathname.startsWith("/sub"))');
+            process.exit(1);
+          }
+          EOFJS
+          
+          # Run apply script
+          node apply_patch.js "$TARGET_FILE" "$PATCH_FILE"
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Patch applied successfully!"
+            
+            # Read stats
+            if [ -f "patch_stats.txt" ]; then
+              cat patch_stats.txt
+              source patch_stats.txt
+              echo "original_size=$original_size" >> $GITHUB_OUTPUT
+              echo "patched_size=$patched_size" >> $GITHUB_OUTPUT
+              echo "diff=$diff" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ Patch application failed!"
+            # Restore backup
+            mv "${TARGET_FILE}.backup" "$TARGET_FILE"
+            echo "♻️  Restored from backup"
+            exit 1
+          fi
+      
+      - name: 🧪 Validate JavaScript syntax
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          
+          echo "🔍 Validating JavaScript syntax..."
+          
+          # Check for syntax errors
+          node -c "$TARGET_FILE"
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ JavaScript syntax is valid"
+          else
+            echo "❌ JavaScript syntax error detected!"
+            echo "♻️  Restoring from backup..."
+            mv "${TARGET_FILE}.backup" "$TARGET_FILE"
+            exit 1
+          fi
+          
+          # Check for common issues
+          echo "🔍 Checking for common issues..."
+          
+          if grep -q "function handleSubPage" "$TARGET_FILE"; then
+            echo "✅ handleSubPage function found"
+          else
+            echo "❌ handleSubPage function not found!"
+            exit 1
+          fi
+          
+          if grep -q "function generateSubPageHTML" "$TARGET_FILE"; then
+            echo "✅ generateSubPageHTML function found"
+          else
+            echo "❌ generateSubPageHTML function not found!"
+            exit 1
+          fi
+          
+          if grep -q "return handleSubPage(url, env)" "$TARGET_FILE"; then
+            echo "✅ Redirect logic replaced"
+          else
+            echo "❌ Redirect logic not replaced!"
+            exit 1
+          fi
+          
+          echo "✅ All validation checks passed!"
+      
+      - name: 📊 Generate patch summary
+        id: summary
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          
+          echo "## 🎉 Patch Application Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Changes" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target File**: \`$TARGET_FILE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Original Size**: ${{ steps.apply.outputs.original_size }} chars" >> $GITHUB_STEP_SUMMARY
+          echo "- **Patched Size**: ${{ steps.apply.outputs.patched_size }} chars" >> $GITHUB_STEP_SUMMARY
+          echo "- **Diff**: ${{ steps.apply.outputs.diff }} chars" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Features Added" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎨 Self-hosted config generator UI" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌍 Advanced filtering (country, protocol, port)" >> $GITHUB_STEP_SUMMARY
+          echo "- 📄 Multiple format support (raw, v2ray, clash, sfa, bfr)" >> $GITHUB_STEP_SUMMARY
+          echo "- 📲 QR code generation" >> $GITHUB_STEP_SUMMARY
+          echo "- 💾 Download & copy functionality" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔗 Share subscription links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Next Steps" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "⚠️ **DRY RUN MODE** - No commit will be made" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
+            echo "1. Review the Pull Request" >> $GITHUB_STEP_SUMMARY
+            echo "2. Merge if everything looks good" >> $GITHUB_STEP_SUMMARY
+            echo "3. Test at \`https://YOUR_WORKER.workers.dev/sub\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "1. Deploy to Cloudflare Workers" >> $GITHUB_STEP_SUMMARY
+            echo "2. Test at \`https://YOUR_WORKER.workers.dev/sub\`" >> $GITHUB_STEP_SUMMARY
+            echo "3. Delete this workflow file if successful" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: 🚫 Dry Run - Show diff
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          
+          echo "📊 DRY RUN - Showing changes (not committing):"
+          echo "=========================================="
+          
+          # Show diff
+          git diff "$TARGET_FILE" || echo "No git diff available"
+          
+          echo "=========================================="
+          echo "✅ Dry run completed. No changes committed."
+          echo "💡 Run again with dry_run=false to commit."
+      
+      - name: 🔀 Switch to target branch
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          
+          echo "🔄 Switching to $TARGET_BRANCH branch..."
+          
+          # Fetch target branch
+          git fetch origin "$TARGET_BRANCH"
+          
+          # Create new branch for PR or checkout target
+          if [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
+            BRANCH_NAME="feat/self-hosted-ui-$(date +%s)"
+            git checkout -b "$BRANCH_NAME" "origin/$TARGET_BRANCH"
+            echo "✅ Created branch: $BRANCH_NAME (from $TARGET_BRANCH)"
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+          else
+            git checkout "$TARGET_BRANCH"
+            echo "✅ Checked out: $TARGET_BRANCH"
+          fi
+          
+          # Copy patched file from testing to target branch
+          git checkout testing -- "${{ github.event.inputs.apply_to_file }}"
+          echo "✅ Copied patched file to $TARGET_BRANCH"
+      
+      - name: 📝 Commit changes
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add "$TARGET_FILE"
+          
+          # Create detailed commit message
+          cat > commit_message.txt << 'EOF'
+          feat(ui): apply self-hosted config generator patch
+          
+          Self-hosted HTML interface untuk proxy configuration.
+          
+          Changes:
+          - ❌ Remove external redirect ke foolvpn.web.id/nautica
+          - ✅ Add handleSubPage() untuk self-hosted HTML rendering
+          - ✅ Add generateSubPageHTML() dengan full UI
+          - ✅ Support /sub?raw untuk direct API access
+          
+          Features:
+          - 🎨 Modern dark theme UI dengan gradient header
+          - 🌍 Country filtering (ID,SG,JP,etc)
+          - 🔐 Protocol selection (VLESS/Trojan/SS)
+          - 🔌 Port selection (443 TLS / 80 NTLS)
+          - 📄 Multiple formats (raw, v2ray, clash, sfa, bfr)
+          - 📲 QR code generation untuk mobile
+          - 💾 Download configs as file
+          - 📋 One-click copy functionality
+          - 🔗 Share subscription links
+          - ⚡ Real-time proxy generation
+          - 📊 Stats display (count, load time)
+          - 🎯 Responsive grid layout
+          - 🇮🇩 Bahasa Indonesia
+          
+          Technical Details:
+          - Original size: ${{ steps.apply.outputs.original_size }} chars
+          - Patched size: ${{ steps.apply.outputs.patched_size }} chars
+          - Lines added: +$(git diff --cached --stat | grep -oP '\d+(?= insertion)')
+          
+          Applied via CI workflow: .github/workflows/apply-patch.yml
+          Source patch: self-hosted-ui.patch (testing branch)
+          
+          Testing:
+          - Access: https://YOUR_WORKER.workers.dev/sub
+          - API mode: https://YOUR_WORKER.workers.dev/sub?raw
+          
+          Co-authored-by: CI Bot <github-actions[bot]@users.noreply.github.com>
+          EOF
+          
+          git commit -F commit_message.txt
+          
+          echo "✅ Changes committed"
+      
+      - name: 🚀 Push to branch
+        if: github.event.inputs.dry_run != 'true' && github.event.inputs.create_pr != 'true'
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          
+          echo "⬆️  Pushing to $TARGET_BRANCH..."
+          git push origin "$TARGET_BRANCH"
+          
+          echo "✅ Successfully pushed to $TARGET_BRANCH"
+          echo "🎉 Patch applied and committed!"
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Success!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Patch has been applied and pushed to \`$TARGET_BRANCH\` branch." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🧪 Testing" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Deploy to Cloudflare Workers" >> $GITHUB_STEP_SUMMARY
+          echo "wrangler deploy" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Test self-hosted UI" >> $GITHUB_STEP_SUMMARY
+          echo "curl -I https://YOUR_WORKER.workers.dev/sub" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📬 Create Pull Request
+        if: github.event.inputs.dry_run != 'true' && github.event.inputs.create_pr == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          BRANCH_NAME="${{ env.branch_name }}"
+          
+          echo "📤 Pushing branch: $BRANCH_NAME"
+          git push origin "$BRANCH_NAME"
+          
+          echo "📬 Creating Pull Request..."
+          
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH_NAME" \
+            --title "🎨 feat(ui): Self-hosted config generator" \
+            --body "## 🚀 Self-Hosted Config Generator
+
+This PR applies the self-hosted UI patch to replace external redirect.
+
+### 📝 Changes
+- ❌ **Removed**: External redirect to foolvpn.web.id/nautica
+- ✅ **Added**: Self-hosted HTML config generator
+- ✅ **Added**: Modern dark theme UI
+- ✅ **Added**: Advanced filtering & multiple formats
+
+### ✨ Features
+- 🌍 Country filtering (ID,SG,JP,US...)
+- 🔐 Protocol selection (VLESS/Trojan/SS)
+- 🔌 Port selection (443 TLS/80 NTLS)
+- 📄 Multiple formats (raw, v2ray, clash, sfa, bfr)
+- 📲 QR code generation
+- 💾 Download & copy functionality
+- 🔗 Share subscription links
+- 🎯 Responsive design
+- 🇮🇩 Bahasa Indonesia
+
+### 📊 Stats
+- **Original Size**: ${{ steps.apply.outputs.original_size }} chars
+- **Patched Size**: ${{ steps.apply.outputs.patched_size }} chars
+- **Diff**: +${{ steps.apply.outputs.diff }} chars
+
+### 🧪 Testing
+\`\`\`bash
+# After merge, deploy and test:
+wrangler deploy
+
+# Access self-hosted UI
+https://YOUR_WORKER.workers.dev/sub
+
+# Direct API access
+https://YOUR_WORKER.workers.dev/sub?raw
+\`\`\`
+
+### 🔗 Links
+- Source patch: [self-hosted-ui.patch](https://github.com/${{ github.repository }}/blob/testing/self-hosted-ui.patch)
+- Applied by: [CI Workflow](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+---
+
+**Note**: This patch was automatically applied via CI workflow.
+Please review the changes before merging.
+
+After successful merge and deployment, please delete the temporary workflow:
+- \`.github/workflows/apply-patch.yml\`
+- \`self-hosted-ui.patch\` (in testing branch)" \
+            --label "enhancement,ui,automated"
+          
+          echo "✅ Pull Request created!"
+      
+      - name: 🧹 Cleanup
+        if: always()
+        run: |
+          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          
+          echo "🧹 Cleaning up temporary files..."
+          
+          # Remove backup
+          rm -f "${TARGET_FILE}.backup"
+          rm -f "apply_patch.js"
+          rm -f "commit_message.txt"
+          rm -f "patch_stats.txt"
+          
+          echo "✅ Cleanup completed"
+      
+      - name: 🎉 Success notification
+        if: success() && github.event.inputs.dry_run != 'true'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎊 Patch Applied Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
+            echo "✅ Pull Request created" >> $GITHUB_STEP_SUMMARY
+            echo "📝 Review and merge the PR to apply changes" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Changes committed to \`${{ github.event.inputs.target_branch }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "🚀 Deploy to Cloudflare Workers to activate" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🗑️ Cleanup Reminder" >> $GITHUB_STEP_SUMMARY
+          echo "After successful deployment, delete:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`.github/workflows/apply-patch.yml\` (main branch)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`self-hosted-ui.patch\` (testing branch)" >> $GITHUB_STEP_SUMMARY
