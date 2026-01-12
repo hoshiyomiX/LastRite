@@ -159,6 +159,108 @@ jobs:
           echo "✅ Propagation wait completed"
           echo "::endgroup::"
 
+      - name: 🔗 Auto-attach custom domains from list
+        run: |
+          echo "::group::Custom Domain Attachment"
+          echo "🎯 Reading domains from .cloudflare/domains.txt..."
+          
+          DOMAINS_FILE=".cloudflare/domains.txt"
+          
+          if [ ! -f "$DOMAINS_FILE" ]; then
+            echo "::error::Domains file not found: $DOMAINS_FILE"
+            exit 1
+          fi
+          
+          # Read domains, skip empty lines and comments
+          DOMAINS=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            # Trim whitespace
+            line=$(echo "$line" | xargs)
+            
+            # Skip empty lines and comments
+            if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+              continue
+            fi
+            
+            DOMAINS+=("$line")
+          done < "$DOMAINS_FILE"
+          
+          if [ ${#DOMAINS[@]} -eq 0 ]; then
+            echo "::error::No domains found in $DOMAINS_FILE"
+            exit 1
+          fi
+          
+          echo "📋 Found ${#DOMAINS[@]} domains to process:"
+          printf '  - %s\n' "${DOMAINS[@]}"
+          echo ""
+          
+          SUCCESS_COUNT=0
+          ALREADY_ATTACHED=0
+          FAILED_COUNT=0
+          FAILED_DOMAINS=()
+          
+          for domain in "${DOMAINS[@]}"; do
+            echo "📌 Processing: $domain"
+            
+            # Try to add domain (idempotent operation)
+            OUTPUT=$(bunx wrangler domains add "$domain" 2>&1 || true)
+            
+            if echo "$OUTPUT" | grep -qi "already exists\|successfully attached\|success"; then
+              if echo "$OUTPUT" | grep -qi "already exists"; then
+                echo "  ✓ Already attached (verified)"
+                ALREADY_ATTACHED=$((ALREADY_ATTACHED + 1))
+              else
+                echo "  ✅ Successfully attached"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              fi
+            else
+              echo "  ⚠️ Warning: $OUTPUT"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              FAILED_DOMAINS+=("$domain")
+            fi
+          done
+          
+          echo ""
+          echo "📊 Attachment Summary:"
+          echo "  ✅ Newly attached: $SUCCESS_COUNT"
+          echo "  ✓ Already attached: $ALREADY_ATTACHED"
+          echo "  ⚠️ Failed: $FAILED_COUNT"
+          echo "  📦 Total domains: ${#DOMAINS[@]}"
+          
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo ""
+            echo "⚠️ Failed domains:"
+            printf '  - %s\n' "${FAILED_DOMAINS[@]}"
+          fi
+          
+          TOTAL_OK=$((SUCCESS_COUNT + ALREADY_ATTACHED))
+          if [ $TOTAL_OK -eq ${#DOMAINS[@]} ]; then
+            echo ""
+            echo "::notice::✅ All ${#DOMAINS[@]} custom domains verified!"
+          elif [ $TOTAL_OK -gt 0 ]; then
+            echo "::warning::Partial success: $TOTAL_OK/${#DOMAINS[@]} domains OK"
+          else
+            echo "::error::No domains attached successfully!"
+            exit 1
+          fi
+          
+          echo "::endgroup::"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: 🔍 Verify domain status
+        run: |
+          echo "::group::Domain Verification"
+          echo "🔍 Listing all attached domains..."
+          
+          bunx wrangler domains list || echo "::warning::Could not list domains"
+          
+          echo "::endgroup::"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
       - name: 🧪 Post-deployment smoke test
         run: |
           echo "::group::Smoke Test"
@@ -238,7 +340,8 @@ jobs:
           echo "::notice::🎉 Clean deployment successful!"
           echo "::notice::🌿 Branch: ${{ github.ref_name }}"
           echo "::notice::📝 Commit: ${{ github.sha }}"
-          echo "::notice::🔗 URL: https://hoshiyomi.qzz.io"
+          echo "::notice::🔗 Primary URL: https://hoshiyomi.qzz.io"
+          echo "::notice::🌐 All custom domains: ACTIVE"
           echo "::notice::♻️ Fresh worker instance with cleared state"
           echo "::notice::🔌 Connection pool: Reset"
           echo "::notice::💾 Cache: Cleared"
