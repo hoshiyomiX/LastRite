@@ -8,28 +8,13 @@ compatibility_flags = ["nodejs_compat_v2"]
 binding = "KV_CACHE"
 id = "a9f61fcc3abf48af91a5924027ee1a1a"
 
-# Custom Domains via Routes
-# Only include domains where zone exists in Cloudflare account
+# Custom domains - attach manually via Cloudflare Dashboard
+# Workers & Pages > last-rite > Settings > Triggers > Custom Domains
+routes = [
+  { pattern = "hoshiyomi.web.id", custom_domain = true }
+]
 
-# qzz.io zone routes (if zone exists in account)
-[[routes]]
-pattern = "hoshiyomi.qzz.io/*"
-zone_name = "qzz.io"
-
-[[routes]]
-pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io/*"
-zone_name = "qzz.io"
-
-[[routes]]
-pattern = "api24-normal.tiktokv.com.hoshiyomi.qzz.io/*"
-zone_name = "qzz.io"
-
-# Removed routes (zone not found in account):
-# - hoshiyomi.web.id/* (zone 'web.id' not available)
-
-# Worker default URL: https://last-rite.workers.dev
-
-# Observability
+# Enable logs for debugging
 [observability]
   [observability.logs]
   enabled = true
