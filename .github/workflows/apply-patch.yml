@@ -79,7 +79,7 @@ jobs:
           
           echo "🔄 Starting patch application..."
           
-          cat > apply_patch.js << 'EOFJS'
+          cat > apply_patch.cjs << 'EOFJS'
           const fs = require('fs');
           const targetFile = process.argv[2];
           const patchFile = process.argv[3];
@@ -145,7 +145,7 @@ jobs:
           }
           EOFJS
           
-          node apply_patch.js "$TARGET_FILE" "$PATCH_FILE"
+          node apply_patch.cjs "$TARGET_FILE" "$PATCH_FILE"
           
           if [ $? -eq 0 ]; then
             echo "✅ Patch applied successfully!"
