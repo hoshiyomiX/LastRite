@@ -173,3 +173,16 @@ dist
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# ============================================
+# Custom: Project-specific junk files
+# ============================================
+
+# Generated obfuscated worker (auto-generated from _worker.js)
+worker.js
+
+# Raw unprocessed proxy list (too large, use processed version)
+rawProxyList.txt
+
+# Bun binary lock file (can be regenerated)
+bun.lockb

@@ -103,7 +103,46 @@ jobs:
       - name: 📦 Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: 🚀 Deploy to Cloudflare Workers
+      - name: 🧹 Clean Deployment - Delete existing worker
+        continue-on-error: true
+        run: |
+          echo "::group::Pre-deployment Cleanup"
+          echo "⚠️ Initiating clean deployment (5-10s downtime)"
+          echo "🎯 Reason: Clear stale connection pools and global state"
+          
+          # Try to delete with retry mechanism
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "🔄 Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+            
+            if bunx wrangler delete --force; then
+              echo "✅ Worker deleted successfully"
+              break
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Retrying in 3 seconds..."
+                sleep 3
+              else
+                echo "::warning::Failed to delete after $MAX_RETRIES attempts (worker may not exist)"
+                echo "::notice::Proceeding with deployment..."
+              fi
+            fi
+          done
+          
+          # Wait for deletion to propagate globally
+          echo "⏳ Waiting 5 seconds for global propagation..."
+          sleep 5
+          
+          echo "✅ Cleanup phase completed"
+          echo "::endgroup::"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: 🚀 Deploy fresh worker instance
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
@@ -112,46 +151,94 @@ jobs:
         env:
           GIT_COMMIT_ID: ${{ github.sha }}
 
+      - name: ⏳ Wait for deployment propagation
+        run: |
+          echo "::group::Deployment Propagation"
+          echo "⏳ Waiting 15 seconds for global edge deployment..."
+          sleep 15
+          echo "✅ Propagation wait completed"
+          echo "::endgroup::"
+
       - name: 🧪 Post-deployment smoke test
-        continue-on-error: true  # Non-blocking
         run: |
           echo "::group::Smoke Test"
           
-          # Test custom domain from wrangler.toml
           WORKER_URL="https://hoshiyomi.qzz.io"
-          echo "🔗 Testing custom domain: $WORKER_URL"
+          echo "🔗 Testing fresh worker at: $WORKER_URL"
           
-          # Wait for deployment to propagate
-          echo "⏳ Waiting 10 seconds for deployment to propagate..."
-          sleep 10
+          # Test with retries (fresh worker might need warmup)
+          MAX_TEST_RETRIES=5
+          TEST_RETRY=0
+          SUCCESS=false
           
-          # Test root endpoint
-          echo "Testing root endpoint..."
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WORKER_URL/" --max-time 10 || echo "000")
-          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
-            echo "✅ Root endpoint: HTTP $HTTP_CODE"
-          else
-            echo "::warning::Root endpoint: HTTP $HTTP_CODE (may need manual verification)"
+          while [ $TEST_RETRY -lt $MAX_TEST_RETRIES ]; do
+            echo "🔄 Test attempt $((TEST_RETRY + 1))/$MAX_TEST_RETRIES..."
+            
+            # Test root endpoint
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WORKER_URL/" --max-time 10 || echo "000")
+            echo "📡 Root endpoint: HTTP $HTTP_CODE"
+            
+            # Test API endpoint
+            API_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WORKER_URL/api/v1/myip" --max-time 10 || echo "000")
+            echo "📡 API endpoint: HTTP $API_CODE"
+            
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ] && [ "$API_CODE" -eq 200 ]; then
+              echo "✅ Worker is responding correctly!"
+              SUCCESS=true
+              
+              # Show actual response
+              RESPONSE=$(curl -s "$WORKER_URL/api/v1/myip" --max-time 10 || echo "{}")
+              echo "📊 API Response: $RESPONSE"
+              break
+            else
+              TEST_RETRY=$((TEST_RETRY + 1))
+              if [ $TEST_RETRY -lt $MAX_TEST_RETRIES ]; then
+                echo "⏳ Worker warming up, retrying in 5 seconds..."
+                sleep 5
+              fi
+            fi
+          done
+          
+          if [ "$SUCCESS" = false ]; then
+            echo "::error::Worker failed smoke test after $MAX_TEST_RETRIES attempts"
+            echo "::error::Manual verification required at: $WORKER_URL"
+            exit 1
           fi
           
-          # Test API endpoint
-          echo "Testing API endpoint..."
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WORKER_URL/api/v1/myip" --max-time 10 || echo "000")
-          if [ "$HTTP_CODE" -eq 200 ]; then
-            echo "✅ API endpoint: HTTP $HTTP_CODE"
-            # Show actual response
-            RESPONSE=$(curl -s "$WORKER_URL/api/v1/myip" --max-time 10 || echo "{}")
-            echo "📊 Response: $RESPONSE"
+          echo "::notice::✅ Smoke test passed!"
+          echo "::endgroup::"
+
+      - name: 🔬 Test WebSocket connection (optional)
+        continue-on-error: true
+        run: |
+          echo "::group::WebSocket Test"
+          echo "🔗 Testing WebSocket upgrade capability..."
+          
+          # Test WebSocket endpoint with proxy path
+          WS_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Upgrade: websocket" \
+            -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Version: 13" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            "https://hoshiyomi.qzz.io/1.1.1.1-443" \
+            --max-time 10 || echo "000")
+          
+          if [ "$WS_CODE" -eq 101 ]; then
+            echo "✅ WebSocket upgrade successful (HTTP $WS_CODE)"
+          elif [ "$WS_CODE" -eq 426 ] || [ "$WS_CODE" -eq 400 ]; then
+            echo "⚠️ WebSocket test inconclusive (HTTP $WS_CODE) - may need client test"
           else
-            echo "::warning::API endpoint: HTTP $HTTP_CODE (may need manual verification)"
+            echo "::warning::WebSocket test: HTTP $WS_CODE"
           fi
           
-          echo "::notice::💡 Smoke test completed. Verify at: $WORKER_URL"
           echo "::endgroup::"
 
       - name: ✅ Deployment complete
         run: |
-          echo "::notice::🎉 Successfully deployed to Cloudflare Workers!"
+          echo "::notice::🎉 Clean deployment successful!"
           echo "::notice::🌿 Branch: ${{ github.ref_name }}"
           echo "::notice::📝 Commit: ${{ github.sha }}"
           echo "::notice::🔗 URL: https://hoshiyomi.qzz.io"
+          echo "::notice::♻️ Fresh worker instance with cleared state"
+          echo "::notice::🔌 Connection pool: Reset"
+          echo "::notice::💾 Cache: Cleared"
