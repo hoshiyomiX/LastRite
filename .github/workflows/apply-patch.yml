@@ -1,8 +1,7 @@
 name: Apply Self-Hosted UI Patch
 
 # TEMPORARY WORKFLOW - DELETE AFTER SUCCESSFUL PATCH APPLICATION
-# Purpose: Apply self-hosted-ui.patch to _worker.js and commit to main branch
-# Location: This workflow is in MAIN branch, patch file is in TESTING branch
+# Purpose: Copy pre-patched _worker.js from testing to main branch
 
 on:
   workflow_dispatch:
@@ -45,251 +44,162 @@ jobs:
           ref: testing
           fetch-depth: 0
       
-      - name: 🔍 Verify patch file exists
-        run: |
-          if [ ! -f "self-hosted-ui.patch" ]; then
-            echo "❌ Error: self-hosted-ui.patch not found!"
-            exit 1
-          fi
-          echo "✅ Patch file found"
-          echo "📄 Patch file size: $(wc -c < self-hosted-ui.patch) bytes"
-      
-      - name: 🔍 Verify target file exists
-        run: |
-          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
-          if [ ! -f "$TARGET_FILE" ]; then
-            echo "❌ Error: $TARGET_FILE not found!"
-            exit 1
-          fi
-          echo "✅ Target file found: $TARGET_FILE"
-          echo "📄 Original size: $(wc -c < $TARGET_FILE) bytes"
-          cp "$TARGET_FILE" "${TARGET_FILE}.backup"
-          echo "💾 Backup created: ${TARGET_FILE}.backup"
-      
-      - name: 🔧 Setup Node.js for validation
+      - name: 🔧 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
       
-      - name: 🎯 Parse and apply patch
-        id: apply
+      - name: 🔍 Validate patched file
+        id: validate
         run: |
           TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
-          PATCH_FILE="self-hosted-ui.patch"
           
-          echo "🔄 Starting patch application..."
-          echo "📋 Target: $TARGET_FILE"
-          echo "📦 Patch: $PATCH_FILE"
-          
-          cat > apply_patch.cjs << 'EOFJS'
-          const fs = require('fs');
-          const targetFile = process.argv[2];
-          const patchFile = process.argv[3];
-          console.log('📖 Reading files...');
-          let workerCode = fs.readFileSync(targetFile, 'utf8');
-          const patchContent = fs.readFileSync(patchFile, 'utf8');
-          console.log(`✅ Worker code: ${workerCode.length} characters`);
-          console.log(`✅ Patch content: ${patchContent.length} characters`);
-          const functionMatch = patchContent.match(/function handleSubPage[\s\S]*?^function generateSubPageHTML[\s\S]*?^}\n```/m);
-          if (!functionMatch) {
-            console.error('❌ Could not extract functions from patch');
-            process.exit(1);
-          }
-          const newFunctions = functionMatch[0].replace(/^```javascript\n/, '').replace(/\n```$/, '').trim();
-          console.log(`✅ Extracted functions: ${newFunctions.length} characters`);
-          const exportMatch = workerCode.match(/^export default \{/m);
-          if (!exportMatch) {
-            console.error('❌ Could not find "export default {" in worker code');
-            process.exit(1);
-          }
-          const insertIndex = exportMatch.index;
-          console.log(`📍 Insertion point found at index: ${insertIndex}`);
-          if (workerCode.includes('function handleSubPage(')) {
-            console.log('⚠️  Functions already exist, will replace...');
-            workerCode = workerCode.replace(/\/\/ ={40,}\n\/\/ SELF-HOSTED SUB PAGE[\s\S]*?(?=^export default \{)/m, '');
-          }
-          const beforeExport = workerCode.substring(0, insertIndex);
-          const afterExport = workerCode.substring(insertIndex);
-          const updatedCode = beforeExport + '// ' + '='.repeat(44) + '\n' + '// SELF-HOSTED SUB PAGE WITH CONFIG GENERATOR\n' + '// ' + '='.repeat(44) + '\n\n' + newFunctions + '\n\n' + afterExport;
-          console.log(`✅ New code size: ${updatedCode.length} characters`);
-          const oldPattern = /if \(url\.pathname\.startsWith\("\/sub"\)\) \{\s*return Response\.redirect\([^}]+\}/;
-          const newLogic = `if (url.pathname.startsWith("/sub")) {\n    return handleSubPage(url, env);\n  }`;
-          if (oldPattern.test(updatedCode)) {
-            const finalCode = updatedCode.replace(oldPattern, newLogic);
-            console.log('✅ Replaced redirect logic');
-            fs.writeFileSync(targetFile, finalCode, 'utf8');
-            console.log(`💾 Updated ${targetFile}`);
-            console.log(`📊 Final size: ${finalCode.length} characters`);
-            fs.writeFileSync('patch_stats.txt', `original_size=${workerCode.length}\npatched_size=${finalCode.length}\ndiff=${finalCode.length - workerCode.length}\n`);
-          } else {
-            console.error('❌ Could not find redirect logic to replace');
-            console.log('🔍 Searching for: if (url.pathname.startsWith("/sub"))');
-            process.exit(1);
-          }
-          EOFJS
-          
-          node apply_patch.cjs "$TARGET_FILE" "$PATCH_FILE"
-          
-          if [ $? -eq 0 ]; then
-            echo "✅ Patch applied successfully!"
-            if [ -f "patch_stats.txt" ]; then
-              cat patch_stats.txt
-              source patch_stats.txt
-              echo "original_size=$original_size" >> $GITHUB_OUTPUT
-              echo "patched_size=$patched_size" >> $GITHUB_OUTPUT
-              echo "diff=$diff" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "❌ Patch application failed!"
-            mv "${TARGET_FILE}.backup" "$TARGET_FILE"
-            echo "♻️  Restored from backup"
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "❌ Error: $TARGET_FILE not found in testing branch!"
             exit 1
           fi
-      
-      - name: 🧪 Validate JavaScript syntax
-        run: |
-          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          
+          echo "✅ File found: $TARGET_FILE"
+          
+          # Get size
+          FILE_SIZE=$(wc -c < "$TARGET_FILE")
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+          echo "📄 File size: $FILE_SIZE bytes"
+          
+          # Validate syntax
           echo "🔍 Validating JavaScript syntax..."
           node -c "$TARGET_FILE"
-          if [ $? -eq 0 ]; then
-            echo "✅ JavaScript syntax is valid"
-          else
-            echo "❌ JavaScript syntax error detected!"
-            mv "${TARGET_FILE}.backup" "$TARGET_FILE"
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Syntax validation failed!"
             exit 1
           fi
-          echo "🔍 Checking for common issues..."
-          if grep -q "function handleSubPage" "$TARGET_FILE"; then
-            echo "✅ handleSubPage function found"
+          
+          echo "✅ Syntax validation passed"
+          
+          # Check functions
+          if grep -q "function handleSubPage" "$TARGET_FILE" && \
+             grep -q "function generateSubPageHTML" "$TARGET_FILE" && \
+             grep -q "return handleSubPage(url, env)" "$TARGET_FILE"; then
+            echo "✅ All required functions found"
           else
-            echo "❌ handleSubPage function not found!"
+            echo "❌ Required functions not found!"
             exit 1
           fi
-          if grep -q "function generateSubPageHTML" "$TARGET_FILE"; then
-            echo "✅ generateSubPageHTML function found"
-          else
-            echo "❌ generateSubPageHTML function not found!"
-            exit 1
-          fi
-          if grep -q "return handleSubPage(url, env)" "$TARGET_FILE"; then
-            echo "✅ Redirect logic replaced"
-          else
-            echo "❌ Redirect logic not replaced!"
-            exit 1
-          fi
+          
           echo "✅ All validation checks passed!"
       
-      - name: 📊 Generate patch summary
-        run: |
-          echo "## 🎉 Patch Application Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📝 Changes" >> $GITHUB_STEP_SUMMARY
-          echo "- **Target File**: \`${{ github.event.inputs.apply_to_file }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Original Size**: ${{ steps.apply.outputs.original_size }} chars" >> $GITHUB_STEP_SUMMARY
-          echo "- **Patched Size**: ${{ steps.apply.outputs.patched_size }} chars" >> $GITHUB_STEP_SUMMARY
-          echo "- **Diff**: ${{ steps.apply.outputs.diff }} chars" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### ✅ Features Added" >> $GITHUB_STEP_SUMMARY
-          echo "- 🎨 Self-hosted config generator UI" >> $GITHUB_STEP_SUMMARY
-          echo "- 🌍 Advanced filtering" >> $GITHUB_STEP_SUMMARY
-          echo "- 📄 Multiple formats" >> $GITHUB_STEP_SUMMARY
-          echo "- 📲 QR code generation" >> $GITHUB_STEP_SUMMARY
-      
-      - name: 🚫 Dry Run - Show diff
+      - name: 🚫 Dry Run
         if: github.event.inputs.dry_run == 'true'
         run: |
-          echo "📊 DRY RUN - Showing changes:"
-          git diff "${{ github.event.inputs.apply_to_file }}" || echo "No diff"
-          echo "✅ Dry run completed."
+          echo "📊 DRY RUN MODE"
+          echo "✅ Would copy ${{ github.event.inputs.apply_to_file }} from testing to ${{ github.event.inputs.target_branch }}"
+          echo "📄 File size: ${{ steps.validate.outputs.file_size }} bytes"
+          echo "💡 Run with dry_run=false to apply changes"
       
       - name: 🔀 Switch to target branch
         if: github.event.inputs.dry_run != 'true'
         run: |
           TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
           git fetch origin "$TARGET_BRANCH"
+          
           if [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
             BRANCH_NAME="feat/self-hosted-ui-$(date +%s)"
             git checkout -b "$BRANCH_NAME" "origin/$TARGET_BRANCH"
             echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+            echo "✅ Created PR branch: $BRANCH_NAME"
           else
             git checkout "$TARGET_BRANCH"
+            echo "✅ Checked out: $TARGET_BRANCH"
           fi
+          
+          # Copy file from testing branch
           git checkout testing -- "${{ github.event.inputs.apply_to_file }}"
+          echo "✅ Copied patched file from testing"
+          
+          # Validate again
+          node -c "${{ github.event.inputs.apply_to_file }}"
+          echo "✅ Post-copy validation passed"
       
-      - name: 📝 Commit changes
+      - name: 📝 Commit
         if: github.event.inputs.dry_run != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "${{ github.event.inputs.apply_to_file }}"
-          git commit -m "feat(ui): apply self-hosted config generator patch" -m "Self-hosted HTML interface untuk proxy configuration." -m "Applied via CI workflow from testing branch patch."
+          git commit -m "feat(ui): add self-hosted config generator" \
+            -m "Self-hosted HTML UI untuk proxy configuration." \
+            -m "" \
+            -m "Features:" \
+            -m "- Modern dark theme UI" \
+            -m "- Country/protocol/port filtering" \
+            -m "- Multiple formats (raw, v2ray, clash, sfa, bfr)" \
+            -m "- QR code generation" \
+            -m "- Download & copy functionality" \
+            -m "- Bahasa Indonesia" \
+            -m "" \
+            -m "Applied from testing branch via CI."
+          echo "✅ Committed"
       
-      - name: 🚀 Push to branch
+      - name: 🚀 Push
         if: github.event.inputs.dry_run != 'true' && github.event.inputs.create_pr != 'true'
         run: |
           git push origin "${{ github.event.inputs.target_branch }}"
-          echo "✅ Successfully pushed to ${{ github.event.inputs.target_branch }}"
+          echo "✅ Pushed to ${{ github.event.inputs.target_branch }}"
       
-      - name: 📬 Create Pull Request
+      - name: 📬 Create PR
         if: github.event.inputs.dry_run != 'true' && github.event.inputs.create_pr == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-          BRANCH_NAME="${{ env.branch_name }}"
+          git push origin "${{ env.branch_name }}"
           
-          git push origin "$BRANCH_NAME"
-          
-          cat > pr_body.md << 'EOFBODY'
+          cat > pr.md << 'EOF'
           ## 🚀 Self-Hosted Config Generator
           
-          This PR applies the self-hosted UI patch to replace external redirect.
+          Adds self-hosted HTML UI for proxy config generation.
           
-          ### 📝 Changes
-          - ❌ Removed: External redirect to foolvpn.web.id/nautica
-          - ✅ Added: Self-hosted HTML config generator
-          - ✅ Added: Modern dark theme UI
+          ### Changes
+          - ❌ Removed: External redirect
+          - ✅ Added: Self-hosted HTML generator
+          - ✅ Added: Modern UI with filtering
           
-          ### ✨ Features
-          - 🌍 Country filtering (ID,SG,JP,US...)
-          - 🔐 Protocol selection (VLESS/Trojan/SS)
-          - 🔌 Port selection (443 TLS/80 NTLS)
-          - 📄 Multiple formats (raw, v2ray, clash, sfa, bfr)
-          - 📲 QR code generation
-          - 💾 Download & copy functionality
-          - 🔗 Share subscription links
-          - 🇮🇩 Bahasa Indonesia
+          ### Features
+          - 🌍 Country filtering
+          - 🔐 Protocol selection
+          - 🔌 Port selection
+          - 📄 Multiple formats
+          - 📲 QR codes
+          - 🇮🇩 Indonesian
           
-          ### 🧪 Testing
+          ### Test
           ```bash
           wrangler deploy
-          curl -I https://YOUR_WORKER.workers.dev/sub
+          curl https://YOUR_WORKER.workers.dev/sub
           ```
-          
-          Applied via CI workflow. Review before merging.
-          EOFBODY
+          EOF
           
           gh pr create \
-            --base "$TARGET_BRANCH" \
-            --head "$BRANCH_NAME" \
+            --base "${{ github.event.inputs.target_branch }}" \
+            --head "${{ env.branch_name }}" \
             --title "🎨 feat(ui): Self-hosted config generator" \
-            --body-file pr_body.md \
-            --label "enhancement,ui,automated"
+            --body-file pr.md \
+            --label "enhancement,ui"
           
-          rm -f pr_body.md
+          rm pr.md
       
-      - name: 🧹 Cleanup
-        if: always()
+      - name: 📊 Summary
+        if: success()
         run: |
-          rm -f "${{ github.event.inputs.apply_to_file }}.backup"
-          rm -f apply_patch.cjs patch_stats.txt
-      
-      - name: 🎉 Success notification
-        if: success() && github.event.inputs.dry_run != 'true'
-        run: |
-          echo "✅ Patch applied successfully!" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
-            echo "Pull Request created. Review and merge." >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "File: \`${{ github.event.inputs.apply_to_file }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Size: ${{ steps.validate.outputs.file_size }} bytes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Mode: Dry run" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
+            echo "Created PR to \`${{ github.event.inputs.target_branch }}\`" >> $GITHUB_STEP_SUMMARY
           else
-            echo "Changes pushed to ${{ github.event.inputs.target_branch }}" >> $GITHUB_STEP_SUMMARY
+            echo "Pushed to \`${{ github.event.inputs.target_branch }}\`" >> $GITHUB_STEP_SUMMARY
           fi
