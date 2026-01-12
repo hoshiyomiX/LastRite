@@ -13,7 +13,7 @@ const inMemoryCache = {
 };
 const CACHE_TTL = 3600000; // 1 hour in milliseconds
 
-// OPTIMIZATION 18: DNS-over-HTTPS cache
+// HIGH-PRIORITY FIX 1: Enhanced DNS cache with KV persistence
 const dnsCache = new Map(); // hostname -> { ip, timestamp }
 const DNS_CACHE_TTL = 600000; // 10 minutes in milliseconds
 const DNS_RESOLVER = "https://cloudflare-dns.com/dns-query"; // Cloudflare DoH
@@ -22,7 +22,9 @@ const dnsStats = {
   misses: 0,
   dohSuccess: 0,
   dohFail: 0,
-  fallback: 0
+  fallback: 0,
+  kvHits: 0,
+  kvMisses: 0
 };
 
 // Known external domains for pre-warming
@@ -33,6 +35,10 @@ const KNOWN_DOMAINS = [
   "foolvpn.web.id",
   "udp-relay.hobihaus.space"
 ];
+
+// HIGH-PRIORITY FIX 2: Periodic pre-warm tracker
+let lastPrewarmTime = 0;
+const PREWARM_INTERVAL = 300000; // 5 minutes
 
 // OPTIMIZATION 12: Connection pooling
 const connectionPool = new Map();
@@ -167,28 +173,49 @@ function formatStats() {
     batch: `b=${batchStats.batched} ub=${batchStats.unbatched} sav=${batchStats.totalBatchSavings}`,
     dedup: `h=${coalesceStats.hits} m=${coalesceStats.misses} s=${coalesceStats.saved}`,
     streaming: `act=${streamingStats.activeStreams} tot=${streamingStats.totalStreamed} bytes=${(streamingStats.streamingBytes/1024).toFixed(0)}KB`,
-    dns: `h=${dnsStats.hits} m=${dnsStats.misses} doh=${dnsStats.dohSuccess} cs=${dnsCache.size}`
+    dns: `h=${dnsStats.hits} m=${dnsStats.misses} kvh=${dnsStats.kvHits} kvm=${dnsStats.kvMisses} doh=${dnsStats.dohSuccess} cs=${dnsCache.size}`
   };
 }
 
-// OPTIMIZATION 18: DNS-over-HTTPS helpers
-async function resolveDNS(hostname) {
+// HIGH-PRIORITY FIX 1: Enhanced DNS resolution with KV persistence
+async function resolveDNS(hostname, env) {
   const now = Date.now();
   
-  // Check cache first
+  // Check in-memory cache first (fastest)
   if (dnsCache.has(hostname)) {
     const cached = dnsCache.get(hostname);
     if (now - cached.timestamp < DNS_CACHE_TTL) {
       dnsStats.hits++;
-      console.log(`[DNS] Cache HIT: ${hostname} -> ${cached.ip} (age: ${Math.floor((now - cached.timestamp) / 1000)}s)`);
+      console.log(`[DNS] Memory cache HIT: ${hostname} -> ${cached.ip} (age: ${Math.floor((now - cached.timestamp) / 1000)}s)`);
       return cached.ip;
     } else {
-      // Expired, remove from cache
       dnsCache.delete(hostname);
     }
   }
   
+  // Check KV cache for persistence across cold starts
+  if (env?.KV_CACHE) {
+    try {
+      const kvKey = `dns:${hostname}`;
+      const kvCached = await env.KV_CACHE.get(kvKey, "json");
+      
+      if (kvCached && (now - kvCached.timestamp < DNS_CACHE_TTL)) {
+        dnsStats.kvHits++;
+        dnsStats.hits++;
+        
+        // Restore to memory cache
+        dnsCache.set(hostname, kvCached);
+        
+        console.log(`[DNS] KV cache HIT: ${hostname} -> ${kvCached.ip} (age: ${Math.floor((now - kvCached.timestamp) / 1000)}s)`);
+        return kvCached.ip;
+      }
+    } catch (err) {
+      console.error(`[DNS] KV read error for ${hostname}:`, err.message);
+    }
+  }
+  
   dnsStats.misses++;
+  dnsStats.kvMisses++;
   console.log(`[DNS] Cache MISS: ${hostname}, resolving via DoH...`);
   
   // Resolve via DNS-over-HTTPS
@@ -201,7 +228,7 @@ async function resolveDNS(hostname) {
         'Accept': 'application/dns-json'
       },
       cf: {
-        cacheTtl: 600, // Cache DoH response for 10 minutes
+        cacheTtl: 600,
         cacheEverything: true
       }
     });
@@ -210,18 +237,34 @@ async function resolveDNS(hostname) {
       const data = await response.json();
       const resolveTime = Date.now() - startTime;
       
-      // Extract first A record
       if (data.Answer && data.Answer.length > 0) {
-        const ip = data.Answer.find(r => r.type === 1)?.data; // Type 1 = A record
+        const ip = data.Answer.find(r => r.type === 1)?.data;
         
         if (ip) {
           dnsStats.dohSuccess++;
           
-          // Cache the result
-          dnsCache.set(hostname, { ip, timestamp: now });
+          const cacheEntry = { ip, timestamp: now };
+          
+          // Store in memory cache
+          dnsCache.set(hostname, cacheEntry);
+          
+          // HIGH-PRIORITY FIX 1: Persist to KV for cross-request persistence
+          if (env?.KV_CACHE) {
+            try {
+              const kvKey = `dns:${hostname}`;
+              await env.KV_CACHE.put(kvKey, JSON.stringify(cacheEntry), {
+                expirationTtl: 600 // 10 minutes
+              });
+              console.log(`[DNS] Stored in KV: ${hostname} -> ${ip}`);
+            } catch (err) {
+              console.error(`[DNS] KV write error for ${hostname}:`, err.message);
+            }
+          } else {
+            console.warn(`[DNS] KV_CACHE not configured - no persistence for ${hostname}`);
+          }
           
           console.log(`[DNS] DoH SUCCESS: ${hostname} -> ${ip} (${resolveTime}ms)`);
-          console.log(`[DNS] Stats: hits=${dnsStats.hits} misses=${dnsStats.misses} doh=${dnsStats.dohSuccess} fallback=${dnsStats.fallback}`);
+          console.log(`[DNS] Stats: hits=${dnsStats.hits} misses=${dnsStats.misses} kvh=${dnsStats.kvHits} kvm=${dnsStats.kvMisses} doh=${dnsStats.dohSuccess}`);
           
           return ip;
         }
@@ -235,25 +278,24 @@ async function resolveDNS(hostname) {
     console.error(`[DNS] DoH ERROR for ${hostname}:`, err.message);
   }
   
-  // Fallback: return hostname (browser/runtime will resolve)
   dnsStats.fallback++;
   console.log(`[DNS] FALLBACK to standard resolution for ${hostname}`);
   return hostname;
 }
 
-// Pre-warm DNS cache for known domains
-async function prewarmDNS() {
+// HIGH-PRIORITY FIX 2: Enhanced pre-warm with env parameter
+async function prewarmDNS(env) {
   console.log('[DNS] Pre-warming cache for known domains...');
   const promises = KNOWN_DOMAINS.map(domain => 
-    resolveDNS(domain).catch(err => {
+    resolveDNS(domain, env).catch(err => {
       console.error(`[DNS] Pre-warm failed for ${domain}:`, err);
     })
   );
   await Promise.allSettled(promises);
-  console.log(`[DNS] Pre-warm complete. Cache size: ${dnsCache.size}`);
+  console.log(`[DNS] Pre-warm complete. Memory cache: ${dnsCache.size}, Stats: kvh=${dnsStats.kvHits} kvm=${dnsStats.kvMisses}`);
 }
 
-// Cleanup old DNS cache entries
+// HIGH-PRIORITY FIX 3: Reduced cleanup frequency (1% instead of 10%)
 function cleanupDNSCache() {
   const now = Date.now();
   let cleaned = 0;
@@ -271,19 +313,17 @@ function cleanupDNSCache() {
 }
 
 // Enhanced fetch with DNS pre-resolution
-async function fetchWithDNS(url, options = {}) {
+async function fetchWithDNS(url, options = {}, env = null) {
   try {
     const urlObj = new URL(url);
     const hostname = urlObj.hostname;
     
-    // Only resolve external domains (not worker's own domain)
     if (!hostname.includes('.workers.dev') && !hostname.includes(APP_DOMAIN)) {
-      await resolveDNS(hostname);
+      await resolveDNS(hostname, env);
     }
     
     return await fetch(url, options);
   } catch (err) {
-    // Fallback to standard fetch
     return await fetch(url, options);
   }
 }
@@ -302,7 +342,6 @@ function getRequestKey(request) {
   const url = new URL(request.url);
   const params = new URLSearchParams();
   
-  // Normalized params (same as cache key)
   const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
   for (const key of paramKeys) {
     const value = url.searchParams.get(key);
@@ -313,42 +352,33 @@ function getRequestKey(request) {
 }
 
 async function deduplicateRequest(request, handler) {
-  // Only deduplicate GET requests
   if (request.method !== 'GET') {
     return handler();
   }
   
   const requestKey = getRequestKey(request);
   
-  // Check if identical request is already pending
   if (pendingRequests.has(requestKey)) {
     coalesceStats.hits++;
     coalesceStats.saved++;
     
     console.log(`[Dedup] Coalescing request: ${requestKey} (hit #${coalesceStats.hits})`);
     
-    // Wait for the in-flight request to complete
     const result = await pendingRequests.get(requestKey);
-    
-    // Clone response to allow multiple reads
     return result.clone();
   }
   
-  // Evict oldest entry if map is full
   if (pendingRequests.size >= REQUEST_COALESCE_MAX_SIZE) {
     const firstKey = pendingRequests.keys().next().value;
     pendingRequests.delete(firstKey);
     console.log(`[Dedup] Evicted oldest entry: ${firstKey}`);
   }
   
-  // No pending request, execute handler
   coalesceStats.misses++;
   console.log(`[Dedup] New request: ${requestKey} (miss #${coalesceStats.misses})`);
   
-  // Create promise for this request
   const promise = handler()
     .then(response => {
-      // Store briefly for sharing (auto-cleanup after TTL)
       setTimeout(() => {
         if (pendingRequests.has(requestKey)) {
           pendingRequests.delete(requestKey);
@@ -359,7 +389,6 @@ async function deduplicateRequest(request, handler) {
       return response;
     })
     .catch(err => {
-      // Remove on error immediately
       pendingRequests.delete(requestKey);
       console.error(`[Dedup] Error, removed: ${requestKey}`, err);
       throw err;
@@ -371,13 +400,11 @@ async function deduplicateRequest(request, handler) {
 
 // OPTIMIZATION 16: Retry helper functions
 function calculateBackoff(attempt) {
-  // Exponential backoff: base * 2^attempt, capped at max
   const exponentialDelay = Math.min(
     RETRY_BASE_DELAY * Math.pow(2, attempt),
     RETRY_MAX_DELAY
   );
   
-  // Add jitter: ±30% randomization to prevent thundering herd
   const jitter = exponentialDelay * RETRY_JITTER_FACTOR * (Math.random() * 2 - 1);
   const totalDelay = Math.max(0, exponentialDelay + jitter);
   
@@ -403,7 +430,6 @@ function recordLatency(address, port, latencyMs) {
   const history = latencyTracker.get(key);
   history.push(latencyMs);
   
-  // Keep only recent history
   if (history.length > LATENCY_HISTORY_SIZE) {
     history.shift();
   }
@@ -418,15 +444,11 @@ function calculateAdaptiveTimeout(address, port, log) {
     return TIMEOUT_DEFAULT;
   }
   
-  // Calculate percentile (P95) for adaptive timeout
   const sorted = [...history].sort((a, b) => a - b);
   const p95Index = Math.floor(sorted.length * 0.95);
   const p95Latency = sorted[p95Index] || sorted[sorted.length - 1];
   
-  // Calculate adaptive timeout: P95 * multiplier
   let adaptiveTimeout = Math.floor(p95Latency * TIMEOUT_MULTIPLIER);
-  
-  // Clamp to min/max bounds
   adaptiveTimeout = Math.max(TIMEOUT_MIN, Math.min(TIMEOUT_MAX, adaptiveTimeout));
   
   timeoutStats.adaptive++;
@@ -437,13 +459,12 @@ function calculateAdaptiveTimeout(address, port, log) {
 }
 
 function cleanupLatencyTracker() {
-  // Cleanup old entries periodically (keep tracker bounded)
   if (latencyTracker.size > 100) {
     const keysToDelete = [];
     let count = 0;
     
     for (const key of latencyTracker.keys()) {
-      if (count++ > 20) break; // Remove oldest 20 entries
+      if (count++ > 20) break;
       keysToDelete.push(key);
     }
     
@@ -462,14 +483,13 @@ async function getPooledConnection(address, port, log) {
   
   if (poolEntry && !poolEntry.socket.closed) {
     poolStats.hits++;
-    connectionPool.delete(key); // Remove from pool when taken
+    connectionPool.delete(key);
     clearTimeout(poolEntry.timeoutId);
     log(`Pool HIT: ${key} (${poolStats.hits} hits, ${poolStats.misses} misses)`);
     return poolEntry.socket;
   }
   
   if (poolEntry) {
-    // Expired or closed connection, cleanup
     connectionPool.delete(key);
   }
   
@@ -478,12 +498,10 @@ async function getPooledConnection(address, port, log) {
 }
 
 function returnToPool(tcpSocket, address, port, log) {
-  // Don't pool if socket is already closed or closing
   if (tcpSocket.closed) {
     return;
   }
   
-  // Evict oldest entry if pool is full
   if (connectionPool.size >= POOL_MAX_SIZE) {
     const firstKey = connectionPool.keys().next().value;
     const oldest = connectionPool.get(firstKey);
@@ -492,9 +510,7 @@ function returnToPool(tcpSocket, address, port, log) {
       clearTimeout(oldest.timeoutId);
       try {
         oldest.socket.close();
-      } catch (e) {
-        // Silent fail
-      }
+      } catch (e) {}
       connectionPool.delete(firstKey);
       poolStats.evictions++;
     }
@@ -502,15 +518,12 @@ function returnToPool(tcpSocket, address, port, log) {
   
   const key = getPoolKey(address, port);
   
-  // Set idle timeout
   const timeoutId = setTimeout(() => {
     if (connectionPool.has(key)) {
       const entry = connectionPool.get(key);
       try {
         entry.socket.close();
-      } catch (e) {
-        // Silent fail
-      }
+      } catch (e) {}
       connectionPool.delete(key);
       log(`Pool cleanup: ${key} (idle timeout)`);
     }
@@ -528,12 +541,10 @@ function returnToPool(tcpSocket, address, port, log) {
 async function getCachedData(cacheKey, fetchFn, ttl, env) {
   const now = Date.now();
   
-  // 1. Check in-memory cache first
   if (inMemoryCache[cacheKey]?.data && (now - inMemoryCache[cacheKey].timestamp) < ttl) {
     return inMemoryCache[cacheKey].data;
   }
   
-  // 2. Check KV cache
   if (env?.KV_CACHE) {
     try {
       const cached = await env.KV_CACHE.get(cacheKey, "json");
@@ -544,13 +555,13 @@ async function getCachedData(cacheKey, fetchFn, ttl, env) {
     } catch (err) {
       console.error(`KV cache read error for ${cacheKey}:`, err);
     }
+  } else {
+    console.warn(`[CACHE] KV_CACHE not configured for ${cacheKey} - performance may be degraded`);
   }
   
-  // 3. Fetch fresh data
   const data = await fetchFn();
   inMemoryCache[cacheKey] = { data, timestamp: now };
   
-  // 4. Store in KV for future requests
   if (env?.KV_CACHE) {
     try {
       await env.KV_CACHE.put(cacheKey, JSON.stringify(data), {
@@ -572,7 +583,7 @@ async function getKVPrxList(kvPrxUrl = KV_PRX_URL, env) {
   return getCachedData(
     "kvPrxList",
     async () => {
-      const kvPrx = await fetchWithDNS(kvPrxUrl); // Use DNS-optimized fetch
+      const kvPrx = await fetchWithDNS(kvPrxUrl, {}, env);
       if (kvPrx.status === 200) {
         return await kvPrx.json();
       }
@@ -597,7 +608,7 @@ async function getPrxListPaginated(prxBankUrl = PRX_BANK_URL, options = {}, env)
   const prxList = await getCachedData(
     "prxList",
     async () => {
-      const prxBank = await fetchWithDNS(prxBankUrl); // Use DNS-optimized fetch
+      const prxBank = await fetchWithDNS(prxBankUrl, {}, env);
       if (prxBank.status === 200) {
         const text = (await prxBank.text()) || "";
         const prxString = text.split("\n").filter(Boolean);
@@ -626,12 +637,10 @@ async function getPrxListPaginated(prxBankUrl = PRX_BANK_URL, options = {}, env)
 function paginateArray(array, offset, limit, filterCC) {
   let filtered = array;
   
-  // Apply country filter
   if (filterCC.length > 0) {
     filtered = array.filter((prx) => filterCC.includes(prx.country));
   }
   
-  // Shuffle for randomization
   shuffleArray(filtered);
   
   const total = filtered.length;
@@ -673,17 +682,14 @@ async function reverseWeb(request, target, targetPath) {
 
 function getCacheKey(request) {
   const url = new URL(request.url);
-  // Normalize URL for consistent cache keys
   const params = new URLSearchParams();
   
-  // Sort params for consistent cache keys
   const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
   for (const key of paramKeys) {
     const value = url.searchParams.get(key);
     if (value) params.set(key, value);
   }
   
-  // Build cache key with sorted params
   const cacheUrl = new URL(url.origin + url.pathname);
   cacheUrl.search = params.toString();
   
@@ -694,7 +700,6 @@ function getCacheKey(request) {
 }
 
 async function handleCachedRequest(request, handler) {
-  // Skip cache for non-GET requests
   if (request.method !== 'GET') {
     return handler();
   }
@@ -702,29 +707,22 @@ async function handleCachedRequest(request, handler) {
   const cache = caches.default;
   const cacheKey = getCacheKey(request);
   
-  // Try to get from cache
   let response = await cache.match(cacheKey);
   
   if (response) {
-    // Cache hit - add header to indicate
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('X-Cache-Status', 'HIT');
     return newResponse;
   }
   
-  // Cache miss - generate response
   response = await handler();
   
-  // Only cache successful responses with Cache-Control header
   if (response.status === 200 && response.headers.has('Cache-Control')) {
-    // Clone response for caching (body can only be read once)
     const responseToCache = response.clone();
     
-    // Add cache status header
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('X-Cache-Status', 'MISS');
     
-    // Store in cache (non-blocking)
     await cache.put(cacheKey, responseToCache);
     
     return newResponse;
@@ -741,7 +739,6 @@ async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimi
   streamingStats.activeStreams++;
   streamingStats.totalStreamed++;
   
-  // Create base URL once
   const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
   baseUri.searchParams.set("encryption", "none");
   baseUri.searchParams.set("type", "ws");
@@ -784,7 +781,6 @@ async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimi
         const configStr = baseUri.toString();
         streamingStats.streamingBytes += configStr.length;
         
-        // Yield each config as it's generated
         yield configStr;
         configCount++;
       }
@@ -803,7 +799,6 @@ function createStreamingResponse(asyncGenerator, responseHeaders, filterFormat) 
     async start(controller) {
       try {
         for await (const config of asyncGenerator) {
-          // Add newline separator (except for first item)
           const line = isFirst ? config : `\n${config}`;
           isFirst = false;
           
@@ -829,19 +824,26 @@ export default {
       APP_DOMAIN = url.hostname;
       serviceName = APP_DOMAIN.split(".")[0];
 
-      // OPTIMIZATION 18: Pre-warm DNS cache on first request
-      if (dnsCache.size === 0) {
-        ctx.waitUntil(prewarmDNS());
+      // HIGH-PRIORITY FIX 4: Enhanced KV configuration check
+      if (!env?.KV_CACHE) {
+        console.warn('[CACHE] ⚠️  KV_CACHE not configured - performance degraded! Add KV binding in wrangler.toml');
+      }
+
+      // HIGH-PRIORITY FIX 2: Periodic DNS pre-warming (every 5 minutes)
+      const now = Date.now();
+      if (now - lastPrewarmTime >= PREWARM_INTERVAL) {
+        lastPrewarmTime = now;
+        ctx.waitUntil(prewarmDNS(env));
+        console.log('[DNS] Triggered periodic pre-warm (5min interval)');
       }
       
-      // Periodic DNS cache cleanup
-      if (Math.random() < 0.1) { // 10% of requests trigger cleanup
+      // HIGH-PRIORITY FIX 3: Reduced cleanup frequency (1% instead of 10%)
+      if (Math.random() < 0.01) {
         ctx.waitUntil(Promise.resolve().then(cleanupDNSCache));
       }
 
       const upgradeHeader = request.headers.get("Upgrade");
 
-      // Handle prx client
       if (upgradeHeader === "websocket") {
         const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
 
@@ -863,7 +865,7 @@ export default {
       } else if (url.pathname.startsWith("/check")) {
         const target = url.searchParams.get("target").split(":");
         
-        const resultPromise = checkPrxHealth(target[0], target[1] || "443");
+        const resultPromise = checkPrxHealth(target[0], target[1] || "443", env);
         
         const result = await Promise.race([
           resultPromise,
@@ -884,7 +886,6 @@ export default {
         const apiPath = url.pathname.replace("/api/v1", "");
 
         if (apiPath.startsWith("/sub")) {
-          // OPTIMIZATION 17: Add request deduplication layer
           return deduplicateRequest(request, () => {
             return handleCachedRequest(request, async () => {
               const offset = +url.searchParams.get("offset") || 0;
@@ -909,7 +910,6 @@ export default {
               const uuid = crypto.randomUUID();
               const ssUsername = btoa(`none:${uuid}`);
               
-              // PATCH 3: Comprehensive stats in response headers
               const stats = formatStats();
               const responseHeaders = {
                 ...CORS_HEADER_OPTIONS,
@@ -918,7 +918,6 @@ export default {
                 "X-Pagination-Total": pagination.total.toString(),
                 "X-Pagination-Has-More": pagination.hasMore.toString(),
                 
-                // PATCH 3: Full optimization metrics
                 "X-Pool-Stats": stats.pool,
                 "X-Buffer-Stats": stats.buffer,
                 "X-Timeout-Stats": stats.timeout,
@@ -927,18 +926,16 @@ export default {
                 "X-Dedup-Stats": stats.dedup,
                 "X-Streaming-Stats": stats.streaming,
                 "X-DNS-Stats": stats.dns,
-                "X-Worker-Optimizations": "OPT11-18-ACTIVE",
+                "X-Worker-Optimizations": "OPT11-18-ACTIVE+HIGH-PRIORITY-FIX",
               };
 
               if (pagination.nextOffset !== null) {
                 responseHeaders["X-Pagination-Next-Offset"] = pagination.nextOffset.toString();
               }
 
-              // OPTIMIZATION 11: Use streaming for raw and v2ray formats
               if (filterFormat === "raw") {
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
                 responseHeaders["X-Streaming-Mode"] = "ACTIVE";
-                // PATCH 2 & 3: Enhanced cache headers with ETag
                 addCacheHeaders(responseHeaders, 3600, 1800);
                 
                 const configStream = generateConfigsStream(
@@ -949,7 +946,6 @@ export default {
                 return createStreamingResponse(configStream, responseHeaders, filterFormat);
                 
               } else if (filterFormat === PROTOCOL_V2) {
-                // For v2ray, we need to collect all configs first (base64 encoding requirement)
                 const result = [];
                 const configStream = generateConfigsStream(
                   prxList, filterPort, filterVPN, filterLimit,
@@ -963,7 +959,6 @@ export default {
                 const finalResult = btoa(result.join("\n"));
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
                 responseHeaders["X-Streaming-Mode"] = "BUFFERED";
-                // PATCH 2 & 3: Enhanced cache headers with ETag
                 addCacheHeaders(responseHeaders, 3600, 1800);
                 
                 return new Response(finalResult, {
@@ -972,7 +967,6 @@ export default {
                 });
                 
               } else if ([PROTOCOL_NEKO, "sfa", "bfr"].includes(filterFormat)) {
-                // For converter formats, collect configs first
                 const result = [];
                 const configStream = generateConfigsStream(
                   prxList, filterPort, filterVPN, filterLimit,
@@ -983,14 +977,14 @@ export default {
                   result.push(config);
                 }
                 
-                const converterPromise = fetchWithDNS(CONVERTER_URL, { // Use DNS-optimized fetch
+                const converterPromise = fetchWithDNS(CONVERTER_URL, {
                   method: "POST",
                   body: JSON.stringify({
                     url: result.join(","),
                     format: filterFormat,
                     template: "cf",
                   }),
-                });
+                }, env);
 
                 const res = await Promise.race([
                   converterPromise,
@@ -1012,7 +1006,6 @@ export default {
                   const contentType = res.headers.get("Content-Type") || "text/plain; charset=utf-8";
                   responseHeaders["Content-Type"] = contentType;
                   responseHeaders["X-Streaming-Mode"] = "CONVERTER";
-                  // PATCH 2 & 3: Enhanced cache headers with ETag
                   addCacheHeaders(responseHeaders, 3600, 1800);
                   
                   return new Response(finalResult, {
@@ -1202,7 +1195,6 @@ function protocolSniffer(buffer) {
   return "ss";
 }
 
-// OPTIMIZATION 14 & 16: Enhanced handleTCPOutBound with adaptive timeout and smart retry
 async function handleTCPOutBound(
   remoteSocket,
   addressRemote,
@@ -1213,7 +1205,6 @@ async function handleTCPOutBound(
   log
 ) {
   async function connectAndWrite(address, port, usePool = true) {
-    // Try to get pooled connection first
     if (usePool) {
       const pooled = await getPooledConnection(address, port, log);
       if (pooled) {
@@ -1225,11 +1216,9 @@ async function handleTCPOutBound(
       }
     }
     
-    // OPTIMIZATION 14: Calculate adaptive timeout
     const adaptiveTimeout = calculateAdaptiveTimeout(address, port, log);
     const connectStart = Date.now();
     
-    // Create new connection
     const connectPromise = new Promise(async (resolve, reject) => {
       try {
         const tcpSocket = connect({
@@ -1240,7 +1229,6 @@ async function handleTCPOutBound(
         
         const connectTime = Date.now() - connectStart;
         
-        // OPTIMIZATION 14: Record latency for future adaptive calculations
         recordLatency(address, port, connectTime);
         
         if (connectTime > adaptiveTimeout * 0.8) {
@@ -1268,7 +1256,6 @@ async function handleTCPOutBound(
     return Promise.race([connectPromise, timeoutPromise]);
   }
 
-  // OPTIMIZATION 16: Smart retry with exponential backoff
   async function retryWithBackoff(attempt = 0) {
     if (attempt >= RETRY_MAX_ATTEMPTS) {
       retryStats.failures++;
@@ -1277,21 +1264,19 @@ async function handleTCPOutBound(
       return;
     }
     
-    // Calculate backoff delay
     const delay = calculateBackoff(attempt);
     retryStats.attempts++;
     retryStats.totalDelay += delay;
     
     log(`Retry attempt ${attempt + 1}/${RETRY_MAX_ATTEMPTS} after ${delay}ms backoff`);
     
-    // Wait with exponential backoff + jitter
     await sleep(delay);
     
     try {
       const tcpSocket = await connectAndWrite(
         prxIP.split(/[:=-]/)[0] || addressRemote,
         prxIP.split(/[:=-]/)[1] || portRemote,
-        false // Don't use pool on retry
+        false
       );
       
       retryStats.successes++;
@@ -1307,7 +1292,6 @@ async function handleTCPOutBound(
       remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
     } catch (err) {
       log(`Retry attempt ${attempt + 1} failed:`, err.message);
-      // Recursive retry with incremented attempt
       await retryWithBackoff(attempt + 1);
     }
   }
@@ -1317,15 +1301,12 @@ async function handleTCPOutBound(
     remoteSocketToWS(tcpSocket, webSocket, responseHeader, retryWithBackoff, log, addressRemote, portRemote);
   } catch (err) {
     log("TCP connection failed", err.message);
-    // Start retry sequence
     await retryWithBackoff(0);
   }
   
-  // OPTIMIZATION 14: Periodic cleanup
   cleanupLatencyTracker();
 }
 
-// OPTIMIZATION 13: Enhanced handleUDPOutbound with buffer management
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay) {
   try {
     let protocolHeader = responseHeader;
@@ -1355,7 +1336,6 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
       }
     });
 
-    // Use fixed timeout for UDP relay (not adaptive)
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => {
         log(`UDP relay timeout after ${UDP_RELAY_TIMEOUT}ms`);
@@ -1369,7 +1349,6 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
       new WritableStream({
         async write(chunk) {
           if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            // OPTIMIZATION 13: Check buffer before sending
             while (webSocket.bufferedAmount > BUFFER_HIGH_WATERMARK) {
               bufferStats.backpressureEvents++;
               await new Promise(resolve => setTimeout(resolve, 10));
@@ -1656,8 +1635,6 @@ function readHorseHeader(buffer) {
   };
 }
 
-// OPTIMIZATION 15 Phase 2: Intelligent chunk batching with adaptive watermark
-// OPTIMIZATION 13 & 14: Enhanced remoteSocketToWS with adaptive buffer management and timeout
 async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
@@ -1669,17 +1646,14 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
   let batchSize = 0;
   let batchTimeout = null;
   
-  // OPTIMIZATION 14: Use adaptive timeout for socket reads
   const adaptiveTimeout = targetAddress ? calculateAdaptiveTimeout(targetAddress, targetPort, log) : TIMEOUT_DEFAULT;
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`Socket read timeout (${adaptiveTimeout}ms)`)), adaptiveTimeout)
   );
 
-  // OPTIMIZATION 15 Phase 2: Smart batch flush
   const flushBatch = async () => {
     if (batchBuffer.length === 0) return;
     
-    // Clear pending timeout
     if (batchTimeout) {
       clearTimeout(batchTimeout);
       batchTimeout = null;
@@ -1687,11 +1661,9 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     
     let combined;
     if (batchBuffer.length === 1) {
-      // Single chunk, no need to combine
       combined = batchBuffer[0];
       batchStats.unbatched++;
     } else {
-      // Combine multiple chunks
       const totalSize = batchBuffer.reduce((sum, chunk) => sum + (chunk.byteLength || chunk.length), 0);
       combined = new Uint8Array(totalSize);
       let offset = 0;
@@ -1712,9 +1684,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     batchSize = 0;
   };
 
-  // OPTIMIZATION 13: Flush buffer queue with backpressure handling
   const flushBuffer = async () => {
-    // First flush any pending batch
     await flushBatch();
     
     while (bufferQueue.length > 0 && !isPaused) {
@@ -1723,7 +1693,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
         return;
       }
       
-      // Check for backpressure
       if (webSocket.bufferedAmount > BUFFER_HIGH_WATERMARK) {
         bufferStats.backpressureEvents++;
         isPaused = true;
@@ -1767,26 +1736,20 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
               header = null;
             }
             
-            // OPTIMIZATION 13: Queue with limit check
             if (bufferQueue.length >= MAX_QUEUE_SIZE) {
               bufferStats.queueOverflows++;
               log(`Queue overflow, dropping old chunks`);
               bufferQueue.shift();
             }
             
-            // OPTIMIZATION 15 Phase 2: Decide whether to batch or send immediately
             const chunkSize = dataToSend.byteLength || dataToSend.length;
             const isInteractive = bytesTransferred < THRESHOLD_MEDIUM;
             const shouldBatch = !isInteractive && chunkSize < COALESCE_THRESHOLD;
             
             if (shouldBatch) {
-              // Add to batch
               batchBuffer.push(dataToSend);
               batchSize += chunkSize;
               
-              // Flush batch if:
-              // 1. Batch size exceeds max
-              // 2. Set timeout for time-based flush (if not already set)
               if (batchSize >= COALESCE_MAX_SIZE) {
                 await flushBatch();
               } else if (!batchTimeout) {
@@ -1796,7 +1759,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
                 }, COALESCE_TIMEOUT);
               }
             } else {
-              // Large chunk or interactive mode: flush batch first, then send immediately
               await flushBatch();
               bufferQueue.push(dataToSend);
               bufferStats.totalQueued++;
@@ -1808,9 +1770,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
           close() {
             log(`remoteConnection closed. Transferred: ${(bytesTransferred/1024/1024).toFixed(2)}MB`);
             
-            // Flush any remaining data
             flushBatch().then(() => flushBuffer()).then(() => {
-              // Return connection to pool if it's still healthy
               if (hasIncomingData && targetAddress && targetPort && !remoteSocket.closed) {
                 returnToPool(remoteSocket, targetAddress, targetPort, log);
                 shouldReturnToPool = false;
@@ -1826,7 +1786,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
           },
         }),
         {
-          // OPTIMIZATION 15 Phase 1: Adaptive watermark based on transfer size
           highWaterMark: bytesTransferred > THRESHOLD_BULK ? WATERMARK_BULK :
                          bytesTransferred > THRESHOLD_MEDIUM ? WATERMARK_BALANCED :
                          WATERMARK_INTERACTIVE,
@@ -1836,7 +1795,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
       timeoutPromise,
     ]);
     
-    // Final flush
     await flushBatch();
     await flushBuffer();
     
@@ -1849,13 +1807,10 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, 
     safeCloseWebSocket(webSocket);
   }
 
-  // Cleanup if not pooled
   if (shouldReturnToPool === false && remoteSocket && !remoteSocket.closed) {
     try {
       remoteSocket.close();
-    } catch (e) {
-      // Silent fail
-    }
+    } catch (e) {}
   }
 
   if (hasIncomingData === false && retry) {
@@ -1874,12 +1829,11 @@ function safeCloseWebSocket(socket) {
   }
 }
 
-async function checkPrxHealth(prxIP, prxPort) {
-  const req = await fetchWithDNS(`${PRX_HEALTH_CHECK_API}?ip=${prxIP}:${prxPort}`); // Use DNS-optimized fetch
+async function checkPrxHealth(prxIP, prxPort, env) {
+  const req = await fetchWithDNS(`${PRX_HEALTH_CHECK_API}?ip=${prxIP}:${prxPort}`, {}, env);
   return await req.json();
 }
 
-// Helpers
 function base64ToArrayBuffer(base64Str) {
   if (!base64Str) {
     return { error: null };
