@@ -1,35 +1,25 @@
 name: Apply Self-Hosted UI Patch
 
 # TEMPORARY WORKFLOW - DELETE AFTER SUCCESSFUL PATCH APPLICATION
-# Purpose: Apply self-hosted-ui.patch to _worker.js and commit to main branch
-# Location: This workflow is in MAIN branch, patch file is in TESTING branch
-
 on:
   workflow_dispatch:
     inputs:
       target_branch:
-        description: 'Target branch untuk commit (main/testing)'
+        description: 'Target branch (main/testing)'
         required: true
         default: 'main'
         type: choice
-        options:
-          - main
-          - testing
+        options: [main, testing]
       create_pr:
-        description: 'Create Pull Request instead of direct commit?'
+        description: 'Create PR instead of direct commit?'
         required: true
         default: false
         type: boolean
       dry_run:
-        description: 'Dry run (test tanpa commit)'
+        description: 'Dry run?'
         required: false
         default: false
         type: boolean
-      apply_to_file:
-        description: 'File target untuk patch'
-        required: false
-        default: '_worker.js'
-        type: string
 
 jobs:
   apply-patch:
@@ -45,183 +35,111 @@ jobs:
           ref: testing
           fetch-depth: 0
       
-      - name: 🔍 Verify patch file exists
-        run: |
-          if [ ! -f "self-hosted-ui.patch" ]; then
-            echo "❌ Error: self-hosted-ui.patch not found!"
-            exit 1
-          fi
-          echo "✅ Patch file found"
-          echo "📄 Patch file size: $(wc -c < self-hosted-ui.patch) bytes"
-      
-      - name: 🔍 Verify target file exists
-        run: |
-          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
-          if [ ! -f "$TARGET_FILE" ]; then
-            echo "❌ Error: $TARGET_FILE not found!"
-            exit 1
-          fi
-          echo "✅ Target file found: $TARGET_FILE"
-          echo "📄 Original size: $(wc -c < $TARGET_FILE) bytes"
-          cp "$TARGET_FILE" "${TARGET_FILE}.backup"
-          echo "💾 Backup created: ${TARGET_FILE}.backup"
-      
-      - name: 🔧 Setup Node.js for validation
+      - name: 🔧 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
       
-      - name: 🎯 Parse and apply patch
+      - name: 🎯 Apply Patch Surgically
         id: apply
         run: |
-          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          TARGET_FILE="_worker.js"
           PATCH_FILE="self-hosted-ui.patch"
-          
-          echo "🔄 Starting patch application..."
           
           cat > apply_patch.cjs << 'EOFJS'
           const fs = require('fs');
           const targetFile = process.argv[2];
           const patchFile = process.argv[3];
           
-          console.log(`📖 Target: ${targetFile}, Patch: ${patchFile}`);
           let workerCode = fs.readFileSync(targetFile, 'utf8');
           const patchContent = fs.readFileSync(patchFile, 'utf8');
           
-          // Improved function extraction: Look for everything between handleSubPage and the end of the script block
-          const functionStart = patchContent.indexOf('function handleSubPage');
-          const lastIndex = patchContent.lastIndexOf('}');
-          const functionEnd = patchContent.indexOf('```', lastIndex);
+          console.log("🛠️  Extracting functions from STEP 1...");
+          const funcStartMark = 'function handleSubPage';
+          const startIdx = patchContent.indexOf(funcStartMark);
+          if (startIdx === -1) throw new Error("Could not find STEP 1 functions");
           
-          if (functionStart === -1 || lastIndex === -1) {
-            console.error('❌ Could not find function start or end in patch');
-            process.exit(1);
-          }
-          
-          const newFunctions = patchContent.substring(functionStart, (functionEnd !== -1 ? functionEnd : patchContent.length)).trim();
-          console.log(`✅ Extracted functions (${newFunctions.length} chars)`);
-          
-          // Find insertion point
+          // Find the NEXT closing code block after the functions start
+          const endIdx = patchContent.indexOf('```', startIdx);
+          const newFunctions = patchContent.substring(startIdx, endIdx).trim();
+          console.log(`✅ Extracted ${newFunctions.length} characters of JS code`);
+
+          // Find insertion point (before export default)
           const exportMatch = workerCode.match(/^export default \{/m);
-          if (!exportMatch) {
-            console.error('❌ Could not find "export default {" in worker code');
-            process.exit(1);
+          if (!exportMatch) throw new Error("Could not find insertion point");
+          
+          // Clean existing if repeat run
+          if (workerCode.includes('function handleSubPage')) {
+            workerCode = workerCode.replace(/\/\/ ={40,}[\s\S]*?(?=export default \{)/, '');
           }
+
+          const insertIdx = workerCode.match(/^export default \{/m).index;
+          workerCode = workerCode.substring(0, insertIdx) + 
+                       "// ============================================\n" +
+                       "// SELF-HOSTED SUB PAGE FUNCTIONS\n" +
+                       "// ============================================\n\n" +
+                       newFunctions + "\n\n" + 
+                       workerCode.substring(insertIdx);
+
+          console.log("🛠️  Replacing redirect logic...");
+          // Pattern yang lebih aman: nyari block startsWith("/sub") sampai penutup block if-nya
+          // Kita pakai string replacement yang spesifik karena formatnya konstan
+          const oldLogic = 'if (url.pathname.startsWith("/sub")) {\n        return Response.redirect(SUB_PAGE_URL + `?host=${APP_DOMAIN}`, 301);\n      }';
+          const newLogic = 'if (url.pathname.startsWith("/sub")) {\n        return handleSubPage(url, env);\n      }';
           
-          // Cleanup existing if present
-          if (workerCode.includes('function handleSubPage(')) {
-            console.log('⚠️  Existing handleSubPage found, cleaning up...');
-            workerCode = workerCode.replace(/\/\/ ={40,}\n\/\/ SELF-HOSTED SUB PAGE[\s\S]*?(?=^export default \{)/m, '');
-          }
-          
-          // Insert new functions
-          const insertIndex = workerCode.match(/^export default \{/m).index;
-          const updatedCode = workerCode.substring(0, insertIndex) + 
-            '// ' + '='.repeat(44) + '\n' +
-            '// SELF-HOSTED SUB PAGE WITH CONFIG GENERATOR\n' +
-            '// ' + '='.repeat(44) + '\n\n' +
-            newFunctions + '\n\n' +
-            workerCode.substring(insertIndex);
-          
-          // Robust redirect logic replacement
-          // Match the entire "if (url.pathname.startsWith("/sub")) { ... }" block
-          const redirectPattern = /if\s*\(url\.pathname\.startsWith\("\/sub"\)\)\s*\{[\s\S]*?return\s+Response\.redirect\([\s\S]*?\);\s*\}/;
-          const newLogic = `if (url.pathname.startsWith("/sub")) {\n    return handleSubPage(url, env);\n  }`;
-          
-          if (redirectPattern.test(updatedCode)) {
-            const finalCode = updatedCode.replace(redirectPattern, newLogic);
-            console.log('✅ Successfully replaced redirect logic');
-            fs.writeFileSync(targetFile, finalCode, 'utf8');
-            
-            fs.writeFileSync('patch_stats.txt', `original_size=${workerCode.length}\npatched_size=${finalCode.length}\ndiff=${finalCode.length - workerCode.length}\n`);
+          if (workerCode.includes(oldLogic)) {
+            workerCode = workerCode.replace(oldLogic, newLogic);
+            console.log("✅ Successfully replaced redirect logic");
           } else {
-            console.error('❌ Could not find redirect logic block to replace');
-            // Log a snippet for debugging
-            const subIndex = updatedCode.indexOf('pathname.startsWith("/sub")');
-            if (subIndex !== -1) {
-              console.log('🔍 Snippet found:', updatedCode.substring(subIndex - 20, subIndex + 100));
+            console.warn("⚠️  Exact match failed, trying fuzzy regex...");
+            const fuzzyPattern = /if\s*\(url\.pathname\.startsWith\("\/sub"\)\)\s*\{[\s\S]*?return\s+Response\.redirect\([\s\S]*?\);\s*\}/;
+            if (fuzzyPattern.test(workerCode)) {
+              workerCode = workerCode.replace(fuzzyPattern, newLogic);
+              console.log("✅ Fuzzy match replaced the logic");
+            } else {
+              throw new Error("Could not find redirect logic to replace");
             }
-            process.exit(1);
           }
+
+          fs.writeFileSync(targetFile, workerCode);
           EOFJS
           
           node apply_patch.cjs "$TARGET_FILE" "$PATCH_FILE"
-          
-          if [ $? -eq 0 ]; then
-            echo "✅ Patch applied successfully!"
-            if [ -f "patch_stats.txt" ]; then
-              source patch_stats.txt
-              echo "original_size=$original_size" >> $GITHUB_OUTPUT
-              echo "patched_size=$patched_size" >> $GITHUB_OUTPUT
-              echo "diff=$diff" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "❌ Patch application failed!"
-            mv "${TARGET_FILE}.backup" "$TARGET_FILE"
-            exit 1
-          fi
-      
-      - name: 🧪 Validate Result
-        run: |
-          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
-          echo "🔍 Validating output..."
-          
-          # Syntax check
-          node -c "$TARGET_FILE"
-          if [ $? -ne 0 ]; then
-            echo "❌ Syntax error detected in patched file!"
-            exit 1
-          fi
-          echo "✅ JavaScript syntax is valid"
-          
-          # Logic check
-          if grep -q "function handleSubPage" "$TARGET_FILE" && grep -q "return handleSubPage(url, env)" "$TARGET_FILE"; then
-            echo "✅ Patch verified: Functions and redirect logic present"
-          else
-            echo "❌ Patch verification failed: Missing required code!"
-            exit 1
-          fi
-      
+
+      - name: 🧪 Syntax Validation
+        run: node -c _worker.js
+
       - name: 🔀 Commit and Push
         if: github.event.inputs.dry_run != 'true'
         run: |
-          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-          TARGET_FILE="${{ github.event.inputs.apply_to_file }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
           git fetch origin "$TARGET_BRANCH"
           
           if [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
-            BRANCH_NAME="feat/self-hosted-ui-$(date +%s)"
+            BRANCH_NAME="fix/self-hosted-ui-$(date +%s)"
             git checkout -b "$BRANCH_NAME" "origin/$TARGET_BRANCH"
-            echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+            git add _worker.js
+            git commit -m "feat(ui): fix self-hosted UI injection logic"
+            git push origin "$BRANCH_NAME"
+            echo "PR_REQUIRED=true" >> $GITHUB_ENV
+            echo "BNAME=$BRANCH_NAME" >> $GITHUB_ENV
           else
             git checkout "$TARGET_BRANCH"
-          fi
-          
-          # Copy patched file from testing context to target branch
-          git checkout testing -- "$TARGET_FILE"
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$TARGET_FILE"
-          git commit -m "feat(ui): apply self-hosted config generator patch" -m "Self-hosted HTML interface added to replacement of external redirect."
-          
-          if [ "${{ github.event.inputs.create_pr }}" = "true" ]; then
-            git push origin "$BRANCH_NAME"
-            echo "PR_CREATION_REQUIRED=true" >> $GITHUB_ENV
-          else
+            git checkout testing -- _worker.js
+            # Re-apply patch in the target branch context just to be safe
+            node apply_patch.cjs _worker.js self-hosted-ui.patch
+            git add _worker.js
+            git commit -m "feat(ui): apply self-hosted UI generator"
             git push origin "$TARGET_BRANCH"
-            echo "✅ Successfully pushed to $TARGET_BRANCH"
           fi
 
-      - name: 📬 Create Pull Request
-        if: env.PR_CREATION_REQUIRED == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 📬 Create PR
+        if: env.PR_REQUIRED == 'true'
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
         run: |
-          gh pr create \
-            --base "${{ github.event.inputs.target_branch }}" \
-            --head "${{ env.branch_name }}" \
-            --title "🎨 feat(ui): Self-hosted config generator" \
-            --body "Applied self-hosted UI patch via CI workflow." \
-            --label "enhancement,automated"
+          gh pr create --base "${{ github.event.inputs.target_branch }}" --head "$BNAME" \
+            --title "🎨 fix(ui): Self-hosted UI Generator" \
+            --body "Fixed injection logic that previously caused syntax errors."
