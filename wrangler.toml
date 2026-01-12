@@ -8,15 +8,19 @@ compatibility_flags = ["nodejs_compat_v2"]
 binding = "KV_CACHE"
 id = "a9f61fcc3abf48af91a5924027ee1a1a"
 
-# Custom domains
-routes = [
-  { pattern = "hoshiyomi.qzz.io", custom_domain = true },
-  { pattern = "hoshiyomi.web.id", custom_domain = true },
-  { pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io", custom_domain = true },
-  { pattern = "api24-normal.tiktokv.com.hoshiyomi.qzz.io", custom_domain = true }
-]
+# Custom Domains Configuration
+# NOTE: Custom domains harus di-attach manual via:
+# 1. Cloudflare Dashboard: Workers & Pages > last-rite > Settings > Triggers > Custom Domains
+# 2. Or via CLI: wrangler domains add hoshiyomi.qzz.io
+#
+# Domain list:
+# - hoshiyomi.qzz.io
+# - hoshiyomi.web.id  
+# - belajar.ruangguru.com.hoshiyomi.qzz.io
+# - api24-normal.tiktokv.com.hoshiyomi.qzz.io
 
-# Enable logs temporarily for debugging
-[observability.logs]
-enabled = true
-invocation_logs = true
+# Enable logs for debugging
+[observability]
+  [observability.logs]
+  enabled = true
+  invocation_logs = true
