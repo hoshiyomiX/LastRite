@@ -9,15 +9,12 @@ binding = "KV_CACHE"
 id = "a9f61fcc3abf48af91a5924027ee1a1a"
 
 # Custom Domains via Routes
-# REQUIREMENT: Domains must be added to Cloudflare DNS first
-# Format: pattern = "domain/*" with zone_name
+# Only include domains where zone exists in Cloudflare account
+
+# qzz.io zone routes (if zone exists in account)
 [[routes]]
 pattern = "hoshiyomi.qzz.io/*"
 zone_name = "qzz.io"
-
-[[routes]]
-pattern = "hoshiyomi.web.id/*"
-zone_name = "web.id"
 
 [[routes]]
 pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io/*"
@@ -27,7 +24,12 @@ zone_name = "qzz.io"
 pattern = "api24-normal.tiktokv.com.hoshiyomi.qzz.io/*"
 zone_name = "qzz.io"
 
-# Enable logs for debugging
+# Removed routes (zone not found in account):
+# - hoshiyomi.web.id/* (zone 'web.id' not available)
+
+# Worker default URL: https://last-rite.workers.dev
+
+# Observability
 [observability]
   [observability.logs]
   enabled = true
