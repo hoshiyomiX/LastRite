@@ -1,35 +1,5 @@
 ============================================================================
 BENCHMARK RESULTS
-Timestamp: 2026-01-13T11:18:11.634Z
-============================================================================
-
-Domain: hoshiyomi.qzz.io
-  Ping: -1ms
-  Download: ERROR
-  Video: smooth
-  Voice: poor
-
-Domain: hoshiyomi.web.id
-  Ping: -1ms
-  Download: ERROR
-  Video: smooth
-  Voice: poor
-
-Domain: belajar.ruangguru.com.hoshiyomi.qzz.io
-  Ping: -1ms
-  Download: ERROR
-  Video: smooth
-  Voice: poor
-
-Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
-  Ping: -1ms
-  Download: ERROR
-  Video: smooth
-  Voice: poor
-
-
-============================================================================
-BENCHMARK RESULTS
 Timestamp: 2026-01-13T11:41:27.280Z
 ============================================================================
 
@@ -121,6 +91,36 @@ Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
 ============================================================================
 BENCHMARK RESULTS
 Timestamp: 2026-01-13T14:23:09.724Z
+============================================================================
+
+Domain: hoshiyomi.qzz.io
+  Ping: -1ms
+  Download: ERROR
+  Video: smooth
+  Voice: poor
+
+Domain: hoshiyomi.web.id
+  Ping: -1ms
+  Download: ERROR
+  Video: smooth
+  Voice: poor
+
+Domain: belajar.ruangguru.com.hoshiyomi.qzz.io
+  Ping: -1ms
+  Download: ERROR
+  Video: smooth
+  Voice: poor
+
+Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
+  Ping: -1ms
+  Download: ERROR
+  Video: smooth
+  Voice: poor
+
+
+============================================================================
+BENCHMARK RESULTS
+Timestamp: 2026-01-13T14:52:47.315Z
 ============================================================================
 
 Domain: hoshiyomi.qzz.io
