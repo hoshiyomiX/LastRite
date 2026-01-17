@@ -25,7 +25,6 @@ jobs:
           node << 'EOF'
           const https = require('https');
           const http = require('http');
-          const dns = require('dns').promises;
           const fs = require('fs');
           
           // Config
@@ -145,14 +144,11 @@ jobs:
             
             const results = {};
             
-            // Test custom domains
+            // Test custom domains (skip DNS pre-check)
             for (const domain of DOMAINS) {
               console.log(`Testing ${domain}...`);
               
               try {
-                // Quick DNS check
-                await dns.resolve4(domain);
-                
                 const latency = await testLatency(domain);
                 const download = await testDownload(domain);
                 
