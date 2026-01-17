@@ -3,28 +3,28 @@ main = "_worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat_v2"]
 
+# Enable workers.dev endpoint for benchmark/monitoring (dual mode)
+workers_dev = true
+
 # KV Cache for DNS + Data Persistence (CONFIGURED)
 [[kv_namespaces]]
 binding = "KV_CACHE"
 id = "a9f61fcc3abf48af91a5924027ee1a1a"
 
 # Custom Domain Routes (with zone IDs)
-# web.id zone
+# web.id zone - specific domain
 [[routes]]
 pattern = "hoshiyomi.web.id/*"
 zone_id = "e119152a4794fc0e608b2177a610b265"
 
-# qzz.io zone  
+# qzz.io zone - base domain
 [[routes]]
 pattern = "hoshiyomi.qzz.io/*"
 zone_id = "e5328b8e5f2ce079260f3be524a3087a"
 
+# qzz.io zone - wildcard untuk ALL subdomains (auto proxy)
 [[routes]]
-pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io/*"
-zone_id = "e5328b8e5f2ce079260f3be524a3087a"
-
-[[routes]]
-pattern = "api24-normal.tiktokv.com.hoshiyomi.qzz.io/*"
+pattern = "*.hoshiyomi.qzz.io/*"
 zone_id = "e5328b8e5f2ce079260f3be524a3087a"
 
 # Observability
