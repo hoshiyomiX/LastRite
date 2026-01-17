@@ -9,7 +9,7 @@ jobs:
   benchmark:
     name: Advanced Performance Test
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12  # Increased from 8
     
     steps:
       - name: Checkout
@@ -22,12 +22,32 @@ jobs:
         with:
           node-version: '20'
       
+      - name: Configure DNS (Cloudflare)
+        run: |
+          # Use Cloudflare DNS untuk reliable resolution
+          echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null
+          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf > /dev/null
+          echo "options timeout:5 attempts:3" | sudo tee -a /etc/resolv.conf > /dev/null
+          cat /etc/resolv.conf
+      
+      - name: Pre-flight DNS Check
+        run: |
+          echo "Testing DNS resolution..."
+          for domain in hoshiyomi.qzz.io hoshiyomi.web.id; do
+            echo -n "Resolving $domain: "
+            if host -W 5 $domain 1.1.1.1; then
+              echo "✓ OK"
+            else
+              echo "✗ FAILED (will retry in benchmark)"
+            fi
+          done
+      
       - name: Run Advanced Benchmark
         run: |
           node << 'EOF'
           const https = require('https');
           const http = require('http');
-          const dns = require('dns').promises;
+          const { execSync } = require('child_process');
           const fs = require('fs');
           
           // Domains from wrangler.toml
@@ -38,71 +58,164 @@ jobs:
             'api24-normal.tiktokv.com.hoshiyomi.qzz.io'
           ];
           
-          // Advanced HTTP request with detailed timing
-          function advancedRequest(url) {
+          // DNS over HTTPS resolver (Cloudflare)
+          async function resolveWithDoH(hostname) {
             return new Promise((resolve, reject) => {
-              const protocol = url.startsWith('https') ? https : http;
-              const urlObj = new URL(url);
-              
-              const timing = {
-                dnsStart: 0, dnsEnd: 0, tcpStart: 0, tcpEnd: 0,
-                tlsStart: 0, tlsEnd: 0, ttfb: 0, transferStart: 0, transferEnd: 0,
-              };
-              
-              const dnsStart = Date.now();
-              dns.lookup(urlObj.hostname).then(() => {
-                timing.dnsEnd = Date.now();
-                timing.dnsStart = dnsStart;
-                timing.tcpStart = Date.now();
+              const dohUrl = `https://1.1.1.1/dns-query?name=${hostname}&type=A`;
+              https.get(dohUrl, {
+                headers: { 'Accept': 'application/dns-json' }
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try {
+                    const json = JSON.parse(data);
+                    if (json.Answer && json.Answer.length > 0) {
+                      resolve(json.Answer[0].data);
+                    } else {
+                      reject(new Error('No DNS answer'));
+                    }
+                  } catch (e) { reject(e); }
+                });
+              }).on('error', reject);
+            });
+          }
+          
+          // Fallback DNS resolution dengan system resolver
+          async function resolveWithSystem(hostname) {
+            try {
+              const result = execSync(`host -W 5 ${hostname} 1.1.1.1`, { 
+                encoding: 'utf8',
+                timeout: 8000 
+              });
+              const match = result.match(/has address ([0-9.]+)/);
+              if (match) return match[1];
+              throw new Error('Parse failed');
+            } catch (e) {
+              throw new Error(`System DNS failed: ${e.message}`);
+            }
+          }
+          
+          // Hybrid DNS resolver dengan retry
+          async function resolveDNS(hostname, retries = 3) {
+            for (let i = 0; i < retries; i++) {
+              try {
+                // Try DoH first
+                const ip = await Promise.race([
+                  resolveWithDoH(hostname),
+                  new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('DoH timeout')), 8000)
+                  )
+                ]);
+                console.log(`  [DNS] ${hostname} -> ${ip} (DoH, attempt ${i+1})`);
+                return ip;
+              } catch (dohErr) {
+                console.log(`  [DNS] DoH failed (${i+1}/${retries}): ${dohErr.message}`);
                 
-                const req = protocol.get(url, (res) => {
-                  timing.tcpEnd = Date.now();
-                  timing.ttfb = Date.now();
-                  timing.transferStart = Date.now();
+                // Fallback to system resolver
+                try {
+                  const ip = await resolveWithSystem(hostname);
+                  console.log(`  [DNS] ${hostname} -> ${ip} (system, attempt ${i+1})`);
+                  return ip;
+                } catch (sysErr) {
+                  console.log(`  [DNS] System failed (${i+1}/${retries}): ${sysErr.message}`);
+                  if (i < retries - 1) {
+                    const backoff = Math.pow(2, i) * 1000;
+                    console.log(`  [DNS] Waiting ${backoff}ms before retry...`);
+                    await new Promise(r => setTimeout(r, backoff));
+                  }
+                }
+              }
+            }
+            throw new Error(`DNS resolution failed after ${retries} attempts`);
+          }
+          
+          // Advanced HTTP request with detailed timing + retry
+          async function advancedRequest(url, retries = 2) {
+            const urlObj = new URL(url);
+            
+            for (let attempt = 0; attempt < retries; attempt++) {
+              try {
+                // Pre-resolve DNS
+                const dnsStart = Date.now();
+                await resolveDNS(urlObj.hostname);
+                const dnsTime = Date.now() - dnsStart;
+                
+                return await new Promise((resolve, reject) => {
+                  const protocol = url.startsWith('https') ? https : http;
+                  const timing = {
+                    dnsTime,
+                    tcpStart: Date.now(),
+                    tcpEnd: 0,
+                    ttfb: 0,
+                    transferStart: 0,
+                    transferEnd: 0,
+                  };
                   
-                  let data = '';
-                  let size = 0;
-                  const chunks = [];
-                  const chunkTimings = [];
-                  
-                  res.on('data', chunk => {
-                    const chunkReceived = Date.now();
-                    data += chunk;
-                    size += chunk.length;
-                    chunks.push(chunk.length);
-                    chunkTimings.push({ size: chunk.length, timestamp: chunkReceived - timing.transferStart });
+                  const req = protocol.get(url, {
+                    timeout: 15000,  // 15s timeout
+                    headers: {
+                      'User-Agent': 'Mozilla/5.0 (GitHub-Actions-Benchmark)',
+                      'Accept': '*/*',
+                      'Connection': 'close'
+                    }
+                  }, (res) => {
+                    timing.tcpEnd = Date.now();
+                    timing.ttfb = Date.now();
+                    timing.transferStart = Date.now();
+                    
+                    let data = '';
+                    let size = 0;
+                    const chunks = [];
+                    const chunkTimings = [];
+                    
+                    res.on('data', chunk => {
+                      const chunkReceived = Date.now();
+                      data += chunk;
+                      size += chunk.length;
+                      chunks.push(chunk.length);
+                      chunkTimings.push({ 
+                        size: chunk.length, 
+                        timestamp: chunkReceived - timing.transferStart 
+                      });
+                    });
+                    
+                    res.on('end', () => {
+                      timing.transferEnd = Date.now();
+                      resolve({ 
+                        timing, 
+                        size, 
+                        data, 
+                        status: res.statusCode,
+                        headers: Object.fromEntries(Object.entries(res.headers)),
+                        chunks, 
+                        chunkTimings,
+                        metrics: {
+                          dnsTime: timing.dnsTime,
+                          tcpTime: timing.tcpEnd - timing.tcpStart,
+                          ttfb: timing.ttfb - timing.tcpStart,
+                          transferTime: timing.transferEnd - timing.transferStart,
+                          totalTime: timing.transferEnd - timing.tcpStart + timing.dnsTime,
+                        }
+                      });
+                    });
                   });
                   
-                  res.on('end', () => {
-                    timing.transferEnd = Date.now();
-                    resolve({ 
-                      timing, size, data, status: res.statusCode,
-                      headers: Object.fromEntries(Object.entries(res.headers)),
-                      chunks, chunkTimings,
-                      metrics: {
-                        dnsTime: timing.dnsEnd - timing.dnsStart,
-                        tcpTime: timing.tcpEnd - timing.tcpStart,
-                        ttfb: timing.ttfb - timing.tcpStart,
-                        transferTime: timing.transferEnd - timing.transferStart,
-                        totalTime: timing.transferEnd - dnsStart,
-                      }
-                    });
+                  req.on('error', reject);
+                  req.on('timeout', () => {
+                    req.destroy();
+                    reject(new Error('Request timeout'));
                   });
                 });
-                
-                req.on('error', reject);
-                
-                // TLS timing (for HTTPS)
-                if (protocol === https) {
-                  req.on('socket', (socket) => {
-                    socket.on('secureConnect', () => {
-                      timing.tlsStart = timing.tcpEnd;
-                      timing.tlsEnd = Date.now();
-                    });
-                  });
+              } catch (err) {
+                console.log(`  [REQ] Attempt ${attempt + 1}/${retries} failed: ${err.message}`);
+                if (attempt < retries - 1) {
+                  await new Promise(r => setTimeout(r, 2000));
+                } else {
+                  throw err;
                 }
-              }).catch(reject);
-            });
+              }
+            }
           }
           
           // PATCH 3: Parse optimization stats from headers
@@ -125,6 +238,7 @@ jobs:
           
           // Test 1: ADVANCED PING - Latency breakdown
           async function advancedPing(domain) {
+            console.log(`\n[PING] Testing ${domain}...`);
             const samples = [], errors = [];
             
             for (let i = 0; i < 10; i++) {
@@ -136,11 +250,19 @@ jobs:
                   tcp: result.metrics.tcpTime,
                   ttfb: result.metrics.ttfb,
                 });
-              } catch (err) { errors.push(err.message); }
-              await new Promise(r => setTimeout(r, 50));
+              } catch (err) { 
+                errors.push(err.message); 
+                console.log(`  Sample ${i+1} failed: ${err.message}`);
+              }
+              await new Promise(r => setTimeout(r, 100));
             }
             
-            if (samples.length === 0) return { error: 'All ping failed', errors, samples: 0 };
+            if (samples.length === 0) {
+              console.log(`  ✗ All pings failed`);
+              return { error: 'All ping failed', errors, samples: 0 };
+            }
+            
+            console.log(`  ✓ ${samples.length}/10 successful`);
             
             const totals = samples.map(s => s.total).sort((a,b) => a-b);
             const dns = samples.map(s => s.dns).sort((a,b) => a-b);
@@ -169,6 +291,7 @@ jobs:
           
           // Test 2: ADVANCED DOWNLOAD - Speed & cache & PATCH 3 optimization metrics
           async function advancedDownload(domain) {
+            console.log(`\n[DOWNLOAD] Testing ${domain}...`);
             const results = [];
             let optimizationMetrics = null;
             
@@ -177,11 +300,9 @@ jobs:
                 const result = await advancedRequest(`https://${domain}/api/v1/sub?cc=US,SG&limit=100&format=raw`);
                 const sizeKB = (result.size / 1024).toFixed(2);
                 
-                // FIX: Prevent division by zero for very fast transfers
-                const transferTime = Math.max(result.metrics.transferTime, 1); // Minimum 1ms
+                const transferTime = Math.max(result.metrics.transferTime, 1);
                 const speedKBs = ((result.size / 1024) / (transferTime / 1000)).toFixed(2);
                 
-                // PATCH 3: Extract optimization headers (only once)
                 if (!optimizationMetrics) {
                   optimizationMetrics = parseOptimizationHeaders(result.headers);
                 }
@@ -193,14 +314,22 @@ jobs:
                   size_kb: parseFloat(sizeKB),
                   cache_status: result.headers['x-cache-status'] || 'UNKNOWN',
                 });
-              } catch (err) { results.push({ error: err.message }); }
-              await new Promise(r => setTimeout(r, 100));
+              } catch (err) { 
+                results.push({ error: err.message }); 
+                console.log(`  Attempt ${attempt+1} failed: ${err.message}`);
+              }
+              await new Promise(r => setTimeout(r, 200));
             }
             
             const cacheHits = results.filter(r => r.cache_status === 'HIT').length;
             const cacheMisses = results.filter(r => r.cache_status === 'MISS').length;
             const validResults = results.filter(r => !r.error);
-            if (validResults.length === 0) return { error: 'All failed', results };
+            if (validResults.length === 0) {
+              console.log(`  ✗ All downloads failed`);
+              return { error: 'All failed', results };
+            }
+            
+            console.log(`  ✓ ${validResults.length}/3 successful`);
             
             const avgSpeed = validResults.reduce((sum, r) => sum + r.speed_kbs, 0) / validResults.length;
             const avgTTFB = validResults.reduce((sum, r) => sum + r.ttfb_ms, 0) / validResults.length;
@@ -211,13 +340,14 @@ jobs:
               avg_ttfb_ms: Math.round(avgTTFB),
               avg_transfer_ms: Math.round(avgTransfer),
               cache: { hits: cacheHits, misses: cacheMisses },
-              optimizations: optimizationMetrics, // PATCH 3: Include optimization metrics
+              optimizations: optimizationMetrics,
               results: results.map(r => ({ speed: r.speed_kbs, cache: r.cache_status, transfer_ms: r.transfer_ms })),
             };
           }
           
           // Test 3: ADVANCED VIDEO - Buffer analysis
           async function advancedVideoStream(domain) {
+            console.log(`\n[VIDEO] Testing ${domain}...`);
             const chunks = 8, chunkResults = [], stallEvents = [];
             
             for (let i = 0; i < chunks; i++) {
@@ -229,12 +359,20 @@ jobs:
                 
                 chunkResults.push({ chunk: i + 1, duration_ms: duration, is_stall: isStall });
                 if (isStall) stallEvents.push({ chunk: i + 1, duration_ms: duration });
-                await new Promise(r => setTimeout(r, 100));
-              } catch (err) { chunkResults.push({ chunk: i + 1, error: err.message }); }
+                await new Promise(r => setTimeout(r, 150));
+              } catch (err) { 
+                chunkResults.push({ chunk: i + 1, error: err.message });
+                console.log(`  Chunk ${i+1} failed: ${err.message}`);
+              }
             }
             
             const successChunks = chunkResults.filter(c => !c.error);
-            if (successChunks.length === 0) return { error: 'All failed', chunks: chunkResults };
+            if (successChunks.length === 0) {
+              console.log(`  ✗ All chunks failed`);
+              return { error: 'All failed', chunks: chunkResults };
+            }
+            
+            console.log(`  ✓ ${successChunks.length}/${chunks} chunks successful`);
             
             const durations = successChunks.map(c => c.duration_ms);
             const avgDuration = durations.reduce((a,b) => a+b, 0) / durations.length;
@@ -250,6 +388,7 @@ jobs:
           
           // Test 4: ADVANCED VOICE - Stability
           async function advancedVoiceCall(domain) {
+            console.log(`\n[VOICE] Testing ${domain}...`);
             const packets = 40, interval = 100, packetResults = [];
             let latencies = [], jitterSamples = [], burstLosses = [], currentBurst = 0;
             
@@ -274,7 +413,12 @@ jobs:
             
             const successPackets = packetResults.filter(p => p.status === 'success').length;
             const packetLoss = ((packets - successPackets) / packets * 100).toFixed(2);
-            if (latencies.length === 0) return { error: 'All dropped', packets: packetResults };
+            console.log(`  ✓ ${successPackets}/${packets} packets received`);
+            
+            if (latencies.length === 0) {
+              console.log(`  ✗ All packets dropped`);
+              return { error: 'All dropped', packets: packetResults };
+            }
             
             const sortedLatencies = [...latencies].sort((a,b) => a-b);
             const avgLatency = Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length);
@@ -305,16 +449,31 @@ jobs:
           
           // Main runner
           async function runAdvancedBenchmark() {
-            console.log('\nADVANCED BENCHMARK\n' + '='.repeat(60));
+            console.log('\n' + '='.repeat(76));
+            console.log('ADVANCED BENCHMARK START');
+            console.log('='.repeat(76));
             const results = {};
             
             for (const domain of DOMAINS) {
-              console.log(`\nTesting ${domain}...`);
-              const ping = await advancedPing(domain);
-              const download = await advancedDownload(domain);
-              const video = await advancedVideoStream(domain);
-              const voice = await advancedVoiceCall(domain);
-              results[domain] = { ping, download, video, voice };
+              console.log(`\n${'='.repeat(76)}`);
+              console.log(`DOMAIN: ${domain}`);
+              console.log('='.repeat(76));
+              
+              try {
+                const ping = await advancedPing(domain);
+                const download = await advancedDownload(domain);
+                const video = await advancedVideoStream(domain);
+                const voice = await advancedVoiceCall(domain);
+                results[domain] = { ping, download, video, voice };
+              } catch (err) {
+                console.log(`\n✗ CRITICAL ERROR for ${domain}: ${err.message}`);
+                results[domain] = { 
+                  ping: { error: err.message }, 
+                  download: { error: err.message },
+                  video: { error: err.message },
+                  voice: { error: err.message }
+                };
+              }
             }
             
             const timestamp = new Date().toISOString();
@@ -342,7 +501,6 @@ jobs:
                 log += '  DOWNLOAD: ' + d.avg_speed_kbs + ' KB/s (transfer=' + d.avg_transfer_ms + 'ms) | TTFB=' + d.avg_ttfb_ms + 'ms\n';
                 log += '            cache: ' + d.cache.hits + ' hits, ' + d.cache.misses + ' misses\n';
                 
-                // PATCH 3: Log optimization metrics if available
                 if (d.optimizations && d.optimizations.optimizations) {
                   log += '  OPTIMIZATIONS: ' + d.optimizations.optimizations + '\n';
                   if (d.optimizations.streamingMode) {
@@ -381,10 +539,15 @@ jobs:
             
             log += '\n';
             fs.appendFileSync('benchmark.log', log);
-            console.log('\nDone! Results appended to benchmark.log');
+            console.log('\n' + '='.repeat(76));
+            console.log('BENCHMARK COMPLETE - Results saved to benchmark.log');
+            console.log('='.repeat(76) + '\n');
           }
           
-          runAdvancedBenchmark().catch(console.error);
+          runAdvancedBenchmark().catch(err => {
+            console.error('\n✗ FATAL ERROR:', err);
+            process.exit(1);
+          });
           EOF
       
       - name: Purge Old Entries (Keep Last 10)
