@@ -278,3 +278,19 @@ api24-normal.tiktokv.com.hoshiyomi.qzz.io
   VIDEO: ERROR
   VOICE: ERROR
 
+
+======================================================================
+Benchmark: 2026-01-17 17:05:07 UTC (50b6d4dd)
+======================================================================
+
+hoshiyomi.web.id
+  Status: 🔴 DOWN
+  Error: queryA ENODATA hoshiyomi.web.id
+
+hoshiyomi.qzz.io
+  Status: 🔴 DOWN
+  Error: queryA ENODATA hoshiyomi.qzz.io
+
+last-rite.hoshiyomix.workers.dev (fallback)
+  Status: 🔴 DOWN
+
