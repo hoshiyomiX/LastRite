@@ -34,11 +34,6 @@ jobs:
             'google.com.hoshiyomi.qzz.io',  // Test wildcard route
           ];
           
-          // Workers.dev fallback (dual mode dari wrangler.toml)
-          // Format: {worker-name}.{account-subdomain}.workers.dev
-          // Get actual URL via: npx wrangler deployments list
-          const FALLBACK_WORKERS_DEV = 'last-rite.hoshiyomix.workers.dev';
-          
           const TIMEOUT = 10000;
           const SAMPLES = 5;
           
@@ -149,7 +144,7 @@ jobs:
             
             const results = {};
             
-            // Test custom domains (dari wrangler.toml routes)
+            // Test all domains dari wrangler.toml routes
             for (const domain of DOMAINS) {
               console.log(`Testing ${domain}...`);
               
@@ -173,27 +168,6 @@ jobs:
               }
             }
             
-            // Fallback test workers.dev (dual mode)
-            console.log(`\nTesting fallback (${FALLBACK_WORKERS_DEV})...`);
-            try {
-              const latency = await testLatency(FALLBACK_WORKERS_DEV);
-              const download = await testDownload(FALLBACK_WORKERS_DEV);
-              
-              results['workers.dev'] = {
-                latency: calcStats(latency),
-                download,
-                health: evaluateHealth(calcStats(latency), download)
-              };
-              
-              console.log(`  ✓ ${results['workers.dev'].health}`);
-            } catch (err) {
-              console.log(`  ✗ Failed: ${err.message}`);
-              results['workers.dev'] = { 
-                error: err.message, 
-                health: '🔴 DOWN' 
-              };
-            }
-            
             // Generate report
             const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
             const commit = process.env.GITHUB_SHA?.slice(0, 8) || 'local';
@@ -203,8 +177,7 @@ jobs:
             report += '='.repeat(70) + '\n\n';
             
             for (const [domain, data] of Object.entries(results)) {
-              const label = domain === 'workers.dev' ? `${FALLBACK_WORKERS_DEV} (fallback)` : domain;
-              report += `${label}\n`;
+              report += `${domain}\n`;
               report += `  Status: ${data.health}\n`;
               
               if (data.error) {

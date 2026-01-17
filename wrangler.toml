@@ -3,8 +3,8 @@ main = "_worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat_v2"]
 
-# Enable workers.dev endpoint for benchmark/monitoring (dual mode)
-workers_dev = true
+# Disable workers.dev endpoint (custom domains only)
+workers_dev = false
 
 # KV Cache for DNS + Data Persistence (CONFIGURED)
 [[kv_namespaces]]
