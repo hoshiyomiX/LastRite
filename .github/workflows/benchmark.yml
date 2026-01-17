@@ -1,570 +1,264 @@
-name: Network Benchmark (Advanced)
+name: Smart Benchmark
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Every 30 minutes
+    - cron: '0 */6 * * *'  # Every 6 hours
   workflow_dispatch:
 
 jobs:
   benchmark:
-    name: Advanced Performance Test
+    name: Performance Check
     runs-on: ubuntu-latest
-    timeout-minutes: 12  # Increased from 8
+    timeout-minutes: 5
     
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: testing
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
       
-      - name: Configure DNS (Cloudflare)
-        run: |
-          # Use Cloudflare DNS untuk reliable resolution
-          echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null
-          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf > /dev/null
-          echo "options timeout:5 attempts:3" | sudo tee -a /etc/resolv.conf > /dev/null
-          cat /etc/resolv.conf
-      
-      - name: Pre-flight DNS Check
-        run: |
-          echo "Testing DNS resolution..."
-          for domain in hoshiyomi.qzz.io hoshiyomi.web.id; do
-            echo -n "Resolving $domain: "
-            if host -W 5 $domain 1.1.1.1; then
-              echo "✓ OK"
-            else
-              echo "✗ FAILED (will retry in benchmark)"
-            fi
-          done
-      
-      - name: Run Advanced Benchmark
+      - name: Run Benchmark
         run: |
           node << 'EOF'
           const https = require('https');
           const http = require('http');
-          const { execSync } = require('child_process');
+          const dns = require('dns').promises;
           const fs = require('fs');
           
-          // Domains from wrangler.toml
+          // Config
           const DOMAINS = [
-            'hoshiyomi.qzz.io',
             'hoshiyomi.web.id',
-            'belajar.ruangguru.com.hoshiyomi.qzz.io',
-            'api24-normal.tiktokv.com.hoshiyomi.qzz.io'
+            'hoshiyomi.qzz.io',
           ];
           
-          // DNS over HTTPS resolver (Cloudflare)
-          async function resolveWithDoH(hostname) {
+          const FALLBACK_WORKERS_DEV = 'last-rite.hoshiyomix.workers.dev';
+          const TIMEOUT = 10000;
+          const SAMPLES = 5;
+          
+          // Simple HTTP request dengan timeout
+          function request(url, timeout = TIMEOUT) {
             return new Promise((resolve, reject) => {
-              const dohUrl = `https://1.1.1.1/dns-query?name=${hostname}&type=A`;
-              https.get(dohUrl, {
-                headers: { 'Accept': 'application/dns-json' }
+              const start = Date.now();
+              const urlObj = new URL(url);
+              const client = url.startsWith('https') ? https : http;
+              
+              const req = client.get(url, {
+                timeout,
+                headers: {
+                  'User-Agent': 'LastRite-Benchmark/2.0',
+                  'Accept': '*/*'
+                }
               }, (res) => {
                 let data = '';
+                const ttfb = Date.now() - start;
+                
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
-                  try {
-                    const json = JSON.parse(data);
-                    if (json.Answer && json.Answer.length > 0) {
-                      resolve(json.Answer[0].data);
-                    } else {
-                      reject(new Error('No DNS answer'));
-                    }
-                  } catch (e) { reject(e); }
+                  resolve({
+                    status: res.statusCode,
+                    ttfb,
+                    duration: Date.now() - start,
+                    size: Buffer.byteLength(data),
+                    headers: res.headers
+                  });
                 });
-              }).on('error', reject);
+              });
+              
+              req.on('error', reject);
+              req.on('timeout', () => {
+                req.destroy();
+                reject(new Error('Timeout'));
+              });
             });
           }
           
-          // Fallback DNS resolution dengan system resolver
-          async function resolveWithSystem(hostname) {
-            try {
-              const result = execSync(`host -W 5 ${hostname} 1.1.1.1`, { 
-                encoding: 'utf8',
-                timeout: 8000 
-              });
-              const match = result.match(/has address ([0-9.]+)/);
-              if (match) return match[1];
-              throw new Error('Parse failed');
-            } catch (e) {
-              throw new Error(`System DNS failed: ${e.message}`);
-            }
-          }
-          
-          // Hybrid DNS resolver dengan retry
-          async function resolveDNS(hostname, retries = 3) {
-            for (let i = 0; i < retries; i++) {
-              try {
-                // Try DoH first
-                const ip = await Promise.race([
-                  resolveWithDoH(hostname),
-                  new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('DoH timeout')), 8000)
-                  )
-                ]);
-                console.log(`  [DNS] ${hostname} -> ${ip} (DoH, attempt ${i+1})`);
-                return ip;
-              } catch (dohErr) {
-                console.log(`  [DNS] DoH failed (${i+1}/${retries}): ${dohErr.message}`);
-                
-                // Fallback to system resolver
-                try {
-                  const ip = await resolveWithSystem(hostname);
-                  console.log(`  [DNS] ${hostname} -> ${ip} (system, attempt ${i+1})`);
-                  return ip;
-                } catch (sysErr) {
-                  console.log(`  [DNS] System failed (${i+1}/${retries}): ${sysErr.message}`);
-                  if (i < retries - 1) {
-                    const backoff = Math.pow(2, i) * 1000;
-                    console.log(`  [DNS] Waiting ${backoff}ms before retry...`);
-                    await new Promise(r => setTimeout(r, backoff));
-                  }
-                }
-              }
-            }
-            throw new Error(`DNS resolution failed after ${retries} attempts`);
-          }
-          
-          // Advanced HTTP request with detailed timing + retry
-          async function advancedRequest(url, retries = 2) {
-            const urlObj = new URL(url);
-            
-            for (let attempt = 0; attempt < retries; attempt++) {
-              try {
-                // Pre-resolve DNS
-                const dnsStart = Date.now();
-                await resolveDNS(urlObj.hostname);
-                const dnsTime = Date.now() - dnsStart;
-                
-                return await new Promise((resolve, reject) => {
-                  const protocol = url.startsWith('https') ? https : http;
-                  const timing = {
-                    dnsTime,
-                    tcpStart: Date.now(),
-                    tcpEnd: 0,
-                    ttfb: 0,
-                    transferStart: 0,
-                    transferEnd: 0,
-                  };
-                  
-                  const req = protocol.get(url, {
-                    timeout: 15000,  // 15s timeout
-                    headers: {
-                      'User-Agent': 'Mozilla/5.0 (GitHub-Actions-Benchmark)',
-                      'Accept': '*/*',
-                      'Connection': 'close'
-                    }
-                  }, (res) => {
-                    timing.tcpEnd = Date.now();
-                    timing.ttfb = Date.now();
-                    timing.transferStart = Date.now();
-                    
-                    let data = '';
-                    let size = 0;
-                    const chunks = [];
-                    const chunkTimings = [];
-                    
-                    res.on('data', chunk => {
-                      const chunkReceived = Date.now();
-                      data += chunk;
-                      size += chunk.length;
-                      chunks.push(chunk.length);
-                      chunkTimings.push({ 
-                        size: chunk.length, 
-                        timestamp: chunkReceived - timing.transferStart 
-                      });
-                    });
-                    
-                    res.on('end', () => {
-                      timing.transferEnd = Date.now();
-                      resolve({ 
-                        timing, 
-                        size, 
-                        data, 
-                        status: res.statusCode,
-                        headers: Object.fromEntries(Object.entries(res.headers)),
-                        chunks, 
-                        chunkTimings,
-                        metrics: {
-                          dnsTime: timing.dnsTime,
-                          tcpTime: timing.tcpEnd - timing.tcpStart,
-                          ttfb: timing.ttfb - timing.tcpStart,
-                          transferTime: timing.transferEnd - timing.transferStart,
-                          totalTime: timing.transferEnd - timing.tcpStart + timing.dnsTime,
-                        }
-                      });
-                    });
-                  });
-                  
-                  req.on('error', reject);
-                  req.on('timeout', () => {
-                    req.destroy();
-                    reject(new Error('Request timeout'));
-                  });
-                });
-              } catch (err) {
-                console.log(`  [REQ] Attempt ${attempt + 1}/${retries} failed: ${err.message}`);
-                if (attempt < retries - 1) {
-                  await new Promise(r => setTimeout(r, 2000));
-                } else {
-                  throw err;
-                }
-              }
-            }
-          }
-          
-          // PATCH 3: Parse optimization stats from headers
-          function parseOptimizationHeaders(headers) {
-            const getHeader = (name) => headers[name.toLowerCase()] || '';
-            
-            return {
-              pool: getHeader('x-pool-stats'),
-              buffer: getHeader('x-buffer-stats'),
-              timeout: getHeader('x-timeout-stats'),
-              retry: getHeader('x-retry-stats'),
-              batch: getHeader('x-batch-stats'),
-              dedup: getHeader('x-dedup-stats'),
-              streaming: getHeader('x-streaming-stats'),
-              dns: getHeader('x-dns-stats'),
-              optimizations: getHeader('x-worker-optimizations'),
-              streamingMode: getHeader('x-streaming-mode'),
-            };
-          }
-          
-          // Test 1: ADVANCED PING - Latency breakdown
-          async function advancedPing(domain) {
-            console.log(`\n[PING] Testing ${domain}...`);
-            const samples = [], errors = [];
-            
-            for (let i = 0; i < 10; i++) {
-              try {
-                const result = await advancedRequest(`https://${domain}/api/v1/myip`);
-                samples.push({
-                  total: result.metrics.totalTime,
-                  dns: result.metrics.dnsTime,
-                  tcp: result.metrics.tcpTime,
-                  ttfb: result.metrics.ttfb,
-                });
-              } catch (err) { 
-                errors.push(err.message); 
-                console.log(`  Sample ${i+1} failed: ${err.message}`);
-              }
-              await new Promise(r => setTimeout(r, 100));
-            }
-            
-            if (samples.length === 0) {
-              console.log(`  ✗ All pings failed`);
-              return { error: 'All ping failed', errors, samples: 0 };
-            }
-            
-            console.log(`  ✓ ${samples.length}/10 successful`);
-            
-            const totals = samples.map(s => s.total).sort((a,b) => a-b);
-            const dns = samples.map(s => s.dns).sort((a,b) => a-b);
-            const tcp = samples.map(s => s.tcp).sort((a,b) => a-b);
-            const ttfb = samples.map(s => s.ttfb).sort((a,b) => a-b);
-            
-            const percentile = (arr, p) => arr[Math.floor(arr.length * p)] || arr[arr.length - 1];
-            const avg = arr => arr.reduce((a,b) => a+b, 0) / arr.length;
-            const stddev = arr => {
-              const mean = avg(arr);
-              return Math.sqrt(arr.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / arr.length);
-            };
-            
-            return {
-              samples: samples.length, errors: errors.length,
-              latency: {
-                avg: Math.round(avg(totals)), p50: Math.round(percentile(totals, 0.5)),
-                p95: Math.round(percentile(totals, 0.95)), p99: Math.round(percentile(totals, 0.99)),
-                jitter: Math.round(stddev(totals)),
-              },
-              breakdown: {
-                dns: Math.round(avg(dns)), tcp: Math.round(avg(tcp)), ttfb: Math.round(avg(ttfb)),
-              },
-            };
-          }
-          
-          // Test 2: ADVANCED DOWNLOAD - Speed & cache & PATCH 3 optimization metrics
-          async function advancedDownload(domain) {
-            console.log(`\n[DOWNLOAD] Testing ${domain}...`);
+          // Test latency dengan multiple samples
+          async function testLatency(domain) {
             const results = [];
-            let optimizationMetrics = null;
             
-            for (let attempt = 0; attempt < 3; attempt++) {
+            for (let i = 0; i < SAMPLES; i++) {
               try {
-                const result = await advancedRequest(`https://${domain}/api/v1/sub?cc=US,SG&limit=100&format=raw`);
-                const sizeKB = (result.size / 1024).toFixed(2);
-                
-                const transferTime = Math.max(result.metrics.transferTime, 1);
-                const speedKBs = ((result.size / 1024) / (transferTime / 1000)).toFixed(2);
-                
-                if (!optimizationMetrics) {
-                  optimizationMetrics = parseOptimizationHeaders(result.headers);
-                }
-                
-                results.push({
-                  speed_kbs: parseFloat(speedKBs), 
-                  ttfb_ms: result.metrics.ttfb,
-                  transfer_ms: transferTime,
-                  size_kb: parseFloat(sizeKB),
-                  cache_status: result.headers['x-cache-status'] || 'UNKNOWN',
-                });
-              } catch (err) { 
-                results.push({ error: err.message }); 
-                console.log(`  Attempt ${attempt+1} failed: ${err.message}`);
-              }
-              await new Promise(r => setTimeout(r, 200));
-            }
-            
-            const cacheHits = results.filter(r => r.cache_status === 'HIT').length;
-            const cacheMisses = results.filter(r => r.cache_status === 'MISS').length;
-            const validResults = results.filter(r => !r.error);
-            if (validResults.length === 0) {
-              console.log(`  ✗ All downloads failed`);
-              return { error: 'All failed', results };
-            }
-            
-            console.log(`  ✓ ${validResults.length}/3 successful`);
-            
-            const avgSpeed = validResults.reduce((sum, r) => sum + r.speed_kbs, 0) / validResults.length;
-            const avgTTFB = validResults.reduce((sum, r) => sum + r.ttfb_ms, 0) / validResults.length;
-            const avgTransfer = validResults.reduce((sum, r) => sum + r.transfer_ms, 0) / validResults.length;
-            
-            return {
-              avg_speed_kbs: avgSpeed.toFixed(2), 
-              avg_ttfb_ms: Math.round(avgTTFB),
-              avg_transfer_ms: Math.round(avgTransfer),
-              cache: { hits: cacheHits, misses: cacheMisses },
-              optimizations: optimizationMetrics,
-              results: results.map(r => ({ speed: r.speed_kbs, cache: r.cache_status, transfer_ms: r.transfer_ms })),
-            };
-          }
-          
-          // Test 3: ADVANCED VIDEO - Buffer analysis
-          async function advancedVideoStream(domain) {
-            console.log(`\n[VIDEO] Testing ${domain}...`);
-            const chunks = 8, chunkResults = [], stallEvents = [];
-            
-            for (let i = 0; i < chunks; i++) {
-              try {
-                const start = Date.now();
-                const result = await advancedRequest(`https://${domain}/api/v1/sub?cc=US&limit=50`);
-                const duration = Date.now() - start;
-                const isStall = duration > 2000;
-                
-                chunkResults.push({ chunk: i + 1, duration_ms: duration, is_stall: isStall });
-                if (isStall) stallEvents.push({ chunk: i + 1, duration_ms: duration });
-                await new Promise(r => setTimeout(r, 150));
-              } catch (err) { 
-                chunkResults.push({ chunk: i + 1, error: err.message });
-                console.log(`  Chunk ${i+1} failed: ${err.message}`);
-              }
-            }
-            
-            const successChunks = chunkResults.filter(c => !c.error);
-            if (successChunks.length === 0) {
-              console.log(`  ✗ All chunks failed`);
-              return { error: 'All failed', chunks: chunkResults };
-            }
-            
-            console.log(`  ✓ ${successChunks.length}/${chunks} chunks successful`);
-            
-            const durations = successChunks.map(c => c.duration_ms);
-            const avgDuration = durations.reduce((a,b) => a+b, 0) / durations.length;
-            const quality = stallEvents.length === 0 ? 'excellent' : stallEvents.length <= 1 ? 'good' :
-                           stallEvents.length <= 2 ? 'acceptable' : 'poor';
-            
-            return {
-              total: chunks, success: successChunks.length, avg_chunk_ms: Math.round(avgDuration),
-              stalls: { count: stallEvents.length, events: stallEvents },
-              quality: quality,
-            };
-          }
-          
-          // Test 4: ADVANCED VOICE - Stability
-          async function advancedVoiceCall(domain) {
-            console.log(`\n[VOICE] Testing ${domain}...`);
-            const packets = 40, interval = 100, packetResults = [];
-            let latencies = [], jitterSamples = [], burstLosses = [], currentBurst = 0;
-            
-            for (let i = 0; i < packets; i++) {
-              try {
-                const start = Date.now();
-                await advancedRequest(`https://${domain}/api/v1/myip`);
-                const latency = Date.now() - start;
-                latencies.push(latency);
-                if (latencies.length > 1) {
-                  jitterSamples.push(Math.abs(latency - latencies[latencies.length - 2]));
-                }
-                packetResults.push({ packet: i + 1, latency_ms: latency, status: 'success' });
-                currentBurst = 0;
+                const res = await request(`https://${domain}/api/v1/myip`);
+                results.push(res.ttfb);
               } catch (err) {
-                packetResults.push({ packet: i + 1, status: 'dropped' });
-                currentBurst++;
-                if (currentBurst >= 2) burstLosses.push({ start: i - currentBurst + 1, length: currentBurst });
+                // Silent fail, akan di-handle di summary
               }
-              await new Promise(r => setTimeout(r, interval));
+              if (i < SAMPLES - 1) await new Promise(r => setTimeout(r, 200));
             }
             
-            const successPackets = packetResults.filter(p => p.status === 'success').length;
-            const packetLoss = ((packets - successPackets) / packets * 100).toFixed(2);
-            console.log(`  ✓ ${successPackets}/${packets} packets received`);
-            
-            if (latencies.length === 0) {
-              console.log(`  ✗ All packets dropped`);
-              return { error: 'All dropped', packets: packetResults };
-            }
-            
-            const sortedLatencies = [...latencies].sort((a,b) => a-b);
-            const avgLatency = Math.round(latencies.reduce((a,b) => a+b, 0) / latencies.length);
-            const p95Latency = sortedLatencies[Math.floor(sortedLatencies.length * 0.95)];
-            const avgJitter = jitterSamples.length > 0 ? Math.round(jitterSamples.reduce((a,b) => a+b, 0) / jitterSamples.length) : 0;
-            const maxJitter = jitterSamples.length > 0 ? Math.max(...jitterSamples) : 0;
-            
-            let callQuality;
-            const lossRate = parseFloat(packetLoss);
-            if (avgLatency < 150 && avgJitter < 30 && lossRate < 1 && burstLosses.length === 0) {
-              callQuality = 'excellent';
-            } else if (avgLatency < 300 && avgJitter < 50 && lossRate < 3) {
-              callQuality = 'good';
-            } else if (avgLatency < 400 && lossRate < 5) {
-              callQuality = 'acceptable';
-            } else {
-              callQuality = 'poor';
-            }
-            
-            return {
-              total: packets, success: successPackets, packet_loss_percent: parseFloat(packetLoss),
-              latency: { avg: avgLatency, p95: p95Latency },
-              jitter: { avg_ms: avgJitter, max_ms: Math.round(maxJitter) },
-              burst_loss: burstLosses.length,
-              call_quality: callQuality,
-            };
+            return results;
           }
           
-          // Main runner
-          async function runAdvancedBenchmark() {
-            console.log('\n' + '='.repeat(76));
-            console.log('ADVANCED BENCHMARK START');
-            console.log('='.repeat(76));
+          // Test download speed
+          async function testDownload(domain) {
+            try {
+              const res = await request(`https://${domain}/api/v1/sub?cc=US,SG&limit=50&format=raw`);
+              const speedMbps = ((res.size * 8) / (res.duration / 1000) / 1_000_000).toFixed(2);
+              return {
+                speedMbps: parseFloat(speedMbps),
+                ttfb: res.ttfb,
+                size: (res.size / 1024).toFixed(1),
+                cache: res.headers['x-cache-status'] || 'UNKNOWN'
+              };
+            } catch (err) {
+              return { error: err.message };
+            }
+          }
+          
+          // Stats calculation
+          function calcStats(values) {
+            if (values.length === 0) return null;
+            
+            const sorted = [...values].sort((a, b) => a - b);
+            const avg = values.reduce((a, b) => a + b, 0) / values.length;
+            const p50 = sorted[Math.floor(sorted.length * 0.5)];
+            const p95 = sorted[Math.floor(sorted.length * 0.95)];
+            const min = sorted[0];
+            const max = sorted[sorted.length - 1];
+            
+            return { avg, p50, p95, min, max, samples: values.length };
+          }
+          
+          // Health check + rating
+          function evaluateHealth(latency, download) {
+            if (!latency || !download || download.error) return '🔴 DOWN';
+            
+            const avgLatency = latency.avg;
+            const p95Latency = latency.p95;
+            const speedMbps = download.speedMbps;
+            
+            if (avgLatency < 100 && p95Latency < 200 && speedMbps > 5) return '🟢 EXCELLENT';
+            if (avgLatency < 200 && p95Latency < 500 && speedMbps > 2) return '🟡 GOOD';
+            if (avgLatency < 500 && p95Latency < 1000) return '🟠 DEGRADED';
+            return '🔴 POOR';
+          }
+          
+          // Main benchmark
+          async function runBenchmark() {
+            console.log('\n' + '='.repeat(60));
+            console.log('LastRite Performance Benchmark');
+            console.log('Timestamp:', new Date().toISOString());
+            console.log('='.repeat(60) + '\n');
+            
             const results = {};
             
+            // Test custom domains
             for (const domain of DOMAINS) {
-              console.log(`\n${'='.repeat(76)}`);
-              console.log(`DOMAIN: ${domain}`);
-              console.log('='.repeat(76));
+              console.log(`Testing ${domain}...`);
               
               try {
-                const ping = await advancedPing(domain);
-                const download = await advancedDownload(domain);
-                const video = await advancedVideoStream(domain);
-                const voice = await advancedVoiceCall(domain);
-                results[domain] = { ping, download, video, voice };
+                // Quick DNS check
+                await dns.resolve4(domain);
+                
+                const latency = await testLatency(domain);
+                const download = await testDownload(domain);
+                
+                results[domain] = {
+                  latency: calcStats(latency),
+                  download,
+                  health: evaluateHealth(calcStats(latency), download)
+                };
+                
+                console.log(`  ✓ ${results[domain].health}`);
               } catch (err) {
-                console.log(`\n✗ CRITICAL ERROR for ${domain}: ${err.message}`);
+                console.log(`  ✗ Failed: ${err.message}`);
                 results[domain] = { 
-                  ping: { error: err.message }, 
-                  download: { error: err.message },
-                  video: { error: err.message },
-                  voice: { error: err.message }
+                  error: err.message, 
+                  health: '🔴 DOWN' 
                 };
               }
             }
             
-            const timestamp = new Date().toISOString();
-            let log = '\n' + '='.repeat(76) + '\n';
-            log += 'ADVANCED BENCHMARK RESULTS\n';
-            log += 'Timestamp: ' + timestamp + '\n';
-            log += 'Commit: ' + (process.env.GITHUB_SHA || 'unknown') + '\n';
-            log += '='.repeat(76) + '\n';
-            
-            for (const [domain, data] of Object.entries(results)) {
-              log += '\n' + domain + '\n';
+            // Fallback test workers.dev
+            console.log(`\nTesting fallback (${FALLBACK_WORKERS_DEV})...`);
+            try {
+              const latency = await testLatency(FALLBACK_WORKERS_DEV);
+              const download = await testDownload(FALLBACK_WORKERS_DEV);
               
-              const p = data.ping;
-              if (p.error) {
-                log += '  PING: ERROR - ' + p.error + '\n';
-              } else {
-                log += '  PING: avg=' + p.latency.avg + 'ms p95=' + p.latency.p95 + 'ms jitter=' + p.latency.jitter + 'ms\n';
-                log += '        breakdown: DNS=' + p.breakdown.dns + 'ms TCP=' + p.breakdown.tcp + 'ms TTFB=' + p.breakdown.ttfb + 'ms\n';
-              }
+              results['workers.dev'] = {
+                latency: calcStats(latency),
+                download,
+                health: evaluateHealth(calcStats(latency), download)
+              };
               
-              const d = data.download;
-              if (d.error) {
-                log += '  DOWNLOAD: ERROR\n';
-              } else {
-                log += '  DOWNLOAD: ' + d.avg_speed_kbs + ' KB/s (transfer=' + d.avg_transfer_ms + 'ms) | TTFB=' + d.avg_ttfb_ms + 'ms\n';
-                log += '            cache: ' + d.cache.hits + ' hits, ' + d.cache.misses + ' misses\n';
-                
-                if (d.optimizations && d.optimizations.optimizations) {
-                  log += '  OPTIMIZATIONS: ' + d.optimizations.optimizations + '\n';
-                  if (d.optimizations.streamingMode) {
-                    log += '    streaming: ' + d.optimizations.streamingMode;
-                    if (d.optimizations.streaming) log += ' | ' + d.optimizations.streaming;
-                    log += '\n';
-                  }
-                  if (d.optimizations.pool) log += '    pool: ' + d.optimizations.pool + '\n';
-                  if (d.optimizations.buffer) log += '    buffer: ' + d.optimizations.buffer + '\n';
-                  if (d.optimizations.timeout) log += '    timeout: ' + d.optimizations.timeout + '\n';
-                  if (d.optimizations.retry) log += '    retry: ' + d.optimizations.retry + '\n';
-                  if (d.optimizations.batch) log += '    batch: ' + d.optimizations.batch + '\n';
-                  if (d.optimizations.dedup) log += '    dedup: ' + d.optimizations.dedup + '\n';
-                  if (d.optimizations.dns) log += '    dns: ' + d.optimizations.dns + '\n';
-                }
-              }
-              
-              const v = data.video;
-              if (v.error) {
-                log += '  VIDEO: ERROR\n';
-              } else {
-                log += '  VIDEO: ' + v.quality.toUpperCase() + ' | avg_chunk=' + v.avg_chunk_ms + 'ms stalls=' + v.stalls.count + '\n';
-                if (v.stalls.count > 0) {
-                  log += '         stall_events: ' + v.stalls.events.map(e => 'chunk' + e.chunk + ':' + e.duration_ms + 'ms').join(', ') + '\n';
-                }
-              }
-              
-              const vo = data.voice;
-              if (vo.error) {
-                log += '  VOICE: ERROR\n';
-              } else {
-                log += '  VOICE: ' + vo.call_quality.toUpperCase() + ' | latency=' + vo.latency.avg + 'ms(' + vo.latency.p95 + 'p95) jitter=' + vo.jitter.avg_ms + 'ms\n';
-                log += '         packet_loss=' + vo.packet_loss_percent + '% burst_events=' + vo.burst_loss + ' success=' + vo.success + '/' + vo.total + '\n';
-              }
+              console.log(`  ✓ ${results['workers.dev'].health}`);
+            } catch (err) {
+              console.log(`  ✗ Failed: ${err.message}`);
+              results['workers.dev'] = { 
+                error: err.message, 
+                health: '🔴 DOWN' 
+              };
             }
             
-            log += '\n';
-            fs.appendFileSync('benchmark.log', log);
-            console.log('\n' + '='.repeat(76));
-            console.log('BENCHMARK COMPLETE - Results saved to benchmark.log');
-            console.log('='.repeat(76) + '\n');
+            // Generate report
+            const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+            const commit = process.env.GITHUB_SHA?.slice(0, 8) || 'local';
+            
+            let report = '\n' + '='.repeat(70) + '\n';
+            report += `Benchmark: ${timestamp} UTC (${commit})\n`;
+            report += '='.repeat(70) + '\n\n';
+            
+            for (const [domain, data] of Object.entries(results)) {
+              const label = domain === 'workers.dev' ? `${FALLBACK_WORKERS_DEV} (fallback)` : domain;
+              report += `${label}\n`;
+              report += `  Status: ${data.health}\n`;
+              
+              if (data.error) {
+                report += `  Error: ${data.error}\n`;
+              } else {
+                const lat = data.latency;
+                const dl = data.download;
+                
+                if (lat) {
+                  report += `  Latency: avg=${Math.round(lat.avg)}ms p50=${Math.round(lat.p50)}ms p95=${Math.round(lat.p95)}ms\n`;
+                  report += `           range=${Math.round(lat.min)}-${Math.round(lat.max)}ms (${lat.samples} samples)\n`;
+                }
+                
+                if (dl && !dl.error) {
+                  report += `  Download: ${dl.speedMbps} Mbps (${dl.size} KB, TTFB ${dl.ttfb}ms)\n`;
+                  report += `  Cache: ${dl.cache}\n`;
+                }
+              }
+              
+              report += '\n';
+            }
+            
+            // Append to log
+            fs.appendFileSync('benchmark.log', report);
+            console.log('\n' + '='.repeat(60));
+            console.log('✓ Benchmark complete');
+            console.log('='.repeat(60) + '\n');
+            
+            // Output summary untuk GitHub Actions
+            console.log('::group::Summary');
+            for (const [domain, data] of Object.entries(results)) {
+              console.log(`${domain}: ${data.health}`);
+            }
+            console.log('::endgroup::');
           }
           
-          runAdvancedBenchmark().catch(err => {
-            console.error('\n✗ FATAL ERROR:', err);
+          runBenchmark().catch(err => {
+            console.error('\n✗ Fatal error:', err.message);
             process.exit(1);
           });
           EOF
       
-      - name: Purge Old Entries (Keep Last 10)
+      - name: Trim Log (Keep Last 20 Entries)
         run: |
           node << 'EOF'
           const fs = require('fs');
-          if (!fs.existsSync('benchmark.log')) { console.log('No log found'); process.exit(0); }
+          if (!fs.existsSync('benchmark.log')) process.exit(0);
+          
           const content = fs.readFileSync('benchmark.log', 'utf8');
-          const sep = '=' + '='.repeat(75);
-          const entries = content.split(sep).filter(e => e.trim().length > 0);
-          console.log('Total entries: ' + entries.length);
-          if (entries.length > 10) {
-            const keep = entries.slice(-10);
-            fs.writeFileSync('benchmark.log', keep.map(e => sep + e).join(''));
-            console.log('Purged ' + (entries.length - 10) + ' old entries');
-          } else {
-            console.log('No purge needed');
+          const entries = content.split(/={70}/g).filter(e => e.trim());
+          
+          if (entries.length > 20) {
+            const keep = entries.slice(-20);
+            fs.writeFileSync('benchmark.log', '=' .repeat(70) + keep.join('=' .repeat(70)));
+            console.log(`Trimmed ${entries.length - 20} old entries`);
           }
           EOF
       
@@ -573,7 +267,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add benchmark.log
+          
           if ! git diff --staged --quiet; then
-            git commit -m "benchmark: $(date -u +"%Y-%m-%d %H:%M UTC") [skip ci]"
+            git commit -m "benchmark: $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
             git push
+          else
+            echo "No changes to commit"
           fi
