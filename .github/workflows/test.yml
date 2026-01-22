@@ -1,0 +1,55 @@
+name: 🧪 Protocol Parser Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - testing
+      - refactor
+    paths:
+      - "src/protocol.js"
+      - "test/protocol.test.js"
+      - "package.json"
+      - "bun.lockb"
+
+jobs:
+  test:
+    name: 🔬 Run Protocol Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🥟 Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 📦 Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: 🧪 Run Protocol Parser Tests
+        id: test
+        run: |
+          echo "::group::Test Output"
+          bun run test/protocol.test.js
+          echo "::endgroup::"
+
+      - name: ✅ Test Summary
+        if: success()
+        run: |
+          echo "🎉 All protocol tests passed!"
+          echo "Coverage:"
+          echo "  ✓ sniffProtocol (Trojan/VLESS/VMess/SS detection)"
+          echo "  ✓ parseTrojanHeader (IPv4/Domain/IPv6 + TCP/UDP)"
+          echo "  ✓ parseVlessHeader (IPv4/Domain/IPv6 + TCP/UDP)"
+          echo "  ✓ parseSsHeader (IPv4/Domain/IPv6)"
+
+      - name: ❌ Test Failure
+        if: failure()
+        run: |
+          echo "::error::Protocol parser tests failed - check output above"
+          exit 1
