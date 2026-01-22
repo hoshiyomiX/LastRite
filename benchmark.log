@@ -1,35 +1,5 @@
 ============================================================================
 BENCHMARK RESULTS
-Timestamp: 2026-01-22T07:48:00.576Z
-============================================================================
-
-Domain: hoshiyomi.qzz.io
-  Ping: 30ms
-  Download: 73.18 KB/s
-  Video: smooth
-  Voice: excellent
-
-Domain: hoshiyomi.web.id
-  Ping: 27ms
-  Download: 2.23 KB/s
-  Video: smooth
-  Voice: excellent
-
-Domain: belajar.ruangguru.com.hoshiyomi.qzz.io
-  Ping: 448ms
-  Download: 92.66 KB/s
-  Video: smooth
-  Voice: excellent
-
-Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
-  Ping: 9ms
-  Download: 2.6 KB/s
-  Video: smooth
-  Voice: excellent
-
-
-============================================================================
-BENCHMARK RESULTS
 Timestamp: 2026-01-22T08:28:23.540Z
 ============================================================================
 
@@ -144,6 +114,36 @@ Domain: belajar.ruangguru.com.hoshiyomi.qzz.io
 Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
   Ping: 418ms
   Download: 79.55 KB/s
+  Video: smooth
+  Voice: excellent
+
+
+============================================================================
+BENCHMARK RESULTS
+Timestamp: 2026-01-22T10:53:38.937Z
+============================================================================
+
+Domain: hoshiyomi.qzz.io
+  Ping: 487ms
+  Download: 40.8 KB/s
+  Video: smooth
+  Voice: excellent
+
+Domain: hoshiyomi.web.id
+  Ping: 22ms
+  Download: 2.6 KB/s
+  Video: smooth
+  Voice: excellent
+
+Domain: belajar.ruangguru.com.hoshiyomi.qzz.io
+  Ping: 515ms
+  Download: 89.16 KB/s
+  Video: smooth
+  Voice: excellent
+
+Domain: api24-normal.tiktokv.com.hoshiyomi.qzz.io
+  Ping: 42ms
+  Download: 3.13 KB/s
   Video: smooth
   Voice: excellent
 
