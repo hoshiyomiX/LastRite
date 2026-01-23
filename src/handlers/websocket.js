@@ -23,7 +23,6 @@ export async function websocketHandler(request, prxIP) {
   webSocket.accept();
 
   // Optimization: Disable logging in production for performance
-  // Only create strings if we are debugging or encountering errors
   const addressLog = ""; 
   const portLog = "";
   const log = (info, event) => {
@@ -71,22 +70,16 @@ export async function websocketHandler(request, prxIP) {
           } else if (protocol === "ss") {
             protocolHeader = readSsHeader(chunk);
           } else {
-            // Unrecognized protocol - don't throw, just close
-            // throw new Error("Unknown Protocol!");
             console.error(`Unknown Protocol detected, closing connection`);
             safeCloseWebSocket(webSocket);
             return;
           }
 
           if (protocolHeader.hasError) {
-             // throw new Error(protocolHeader.message);
              console.error(`Protocol Error: ${protocolHeader.message}`);
              safeCloseWebSocket(webSocket);
              return;
           }
-
-          // addressLog = protocolHeader.addressRemote;
-          // portLog = `${protocolHeader.portRemote} -> ${protocolHeader.isUDP ? "UDP" : "TCP"}`;
 
           if (protocolHeader.isUDP) {
             if (protocolHeader.portRemote === 53) {
