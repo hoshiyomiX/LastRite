@@ -37,31 +37,33 @@ jobs:
           # Cache disabled because no package-lock.json exists yet (using bun.lockb)
           # cache: 'npm' 
 
-      - name: Install Dependencies
-        run: npm install
-
       - name: Deploy and Capture Log
         id: deploy_step
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # Run deployment and capture output
-          set +e
-          
+          # Create log file immediately
+          touch deployment.log
           echo "=== START CLEAN DEPLOY ===" > deployment.log
           
-          # Optional: Delete existing worker to clear history/state (Fresh Deploy)
-          # Ignoring errors (e.g. if worker doesn't exist yet)
-          echo "Step 1: Deleting existing worker..." >> deployment.log
-          npx wrangler delete --force >> deployment.log 2>&1
+          # Wrap entire process in a block to capture output
+          {
+            echo "Step 0: Installing Dependencies..."
+            npm install || echo "npm install failed with exit code $?"
+            
+            echo -e "\nStep 1: Deleting existing worker..."
+            # Optional: Delete existing worker to clear history/state (Fresh Deploy)
+            # Ignoring errors (e.g. if worker doesn't exist yet)
+            npx wrangler delete --force || true
+            
+            echo -e "\nStep 2: Deploying new version..."
+            npx wrangler deploy
+            
+          } >> deployment.log 2>&1
           
-          # Deploy new version
-          echo -e "\nStep 2: Deploying new version..." >> deployment.log
-          npx wrangler deploy >> deployment.log 2>&1
+          # Capture exit code of the last command (wrangler deploy)
           EXIT_CODE=$?
-          
-          set -e
           
           # Output to console for visibility
           cat deployment.log
@@ -78,9 +80,9 @@ jobs:
           # Pull latest to avoid conflict
           git pull origin ${{ github.ref_name }} --rebase || true
           
-          # Create placeholder if log missing
+          # Ensure log exists even if previous step crashed
           if [ ! -f deployment.log ]; then
-            echo "Deployment step skipped or failed to start." > deployment.log
+            echo "Deployment step crashed or failed to create log." > deployment.log
           fi
           
           # Force add ignored file
@@ -98,7 +100,11 @@ jobs:
         if: always()
         run: |
           if [ -z "$EXIT_CODE" ]; then
-             echo "Deployment step did not run."
+             echo "Deployment step did not run or crashed early."
+             # If log exists, print it
+             if [ -f deployment.log ]; then
+               cat deployment.log
+             fi
              exit 1
           fi
 
