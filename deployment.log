@@ -9,11 +9,11 @@
   After installation, run Wrangler with `npx wrangler`.
 
 
-Total Upload: 56.26 KiB / gzip: 13.56 KiB
+Total Upload: 56.00 KiB / gzip: 13.49 KiB
 No bindings found.
-Uploaded lastrite (2.71 sec)
-Deployed lastrite triggers (0.33 sec)
+Uploaded lastrite (4.32 sec)
+Deployed lastrite triggers (0.40 sec)
   https://lastrite.katahiranaruse-daydream.workers.dev
-Current Version ID: 3a3b667f-14ac-450d-bd0a-bc00296fc3fa
+Current Version ID: 3c60cabe-757d-4bd5-bd88-c6f2487a5541
 
 Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more at https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler/telemetry.md
