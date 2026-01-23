@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to deploy (informational only, select above)'
+        description: 'Branch to deploy'
         required: false
         default: 'refactor-modular'
 
@@ -36,26 +36,40 @@ jobs:
           node-version: 20
           cache: 'npm'
 
-      - name: Install Dependencies
-        run: npm install
-
-      - name: Deploy and Capture Log
-        id: deploy_step
+      - name: Execute Deployment Sequence
+        id: deploy_seq
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # Run deployment and capture output
+          # Initialize Log
+          echo "=== Deployment Started at $(date) ===" > deployment.log
+          
+          # 1. Install Dependencies
+          echo ">> Running npm install..." >> deployment.log
           set +e
-          npx wrangler deploy > deployment.log 2>&1
-          EXIT_CODE=$?
+          npm install >> deployment.log 2>&1
+          INSTALL_EXIT=$?
           set -e
           
-          # Output to console for visibility
-          cat deployment.log
+          if [ $INSTALL_EXIT -ne 0 ]; then
+            echo "!! npm install failed with code $INSTALL_EXIT" >> deployment.log
+            echo "EXIT_CODE=$INSTALL_EXIT" >> $GITHUB_ENV
+            echo "FAILED_STAGE=install" >> $GITHUB_ENV
+          else
+            # 2. Deploy only if install succeeded
+            echo ">> Running wrangler deploy..." >> deployment.log
+            set +e
+            npx wrangler deploy >> deployment.log 2>&1
+            WRANGLER_EXIT=$?
+            set -e
+            
+            echo "EXIT_CODE=$WRANGLER_EXIT" >> $GITHUB_ENV
+            echo "FAILED_STAGE=deploy" >> $GITHUB_ENV
+          fi
           
-          # Save exit code for later check
-          echo "EXIT_CODE=$EXIT_CODE" >> $GITHUB_ENV
+          # Output log to console for immediate debug
+          cat deployment.log
 
       - name: Commit Deployment Log
         if: always()
@@ -66,15 +80,10 @@ jobs:
           # Pull latest to avoid conflict
           git pull origin ${{ github.ref_name }} --rebase || true
           
-          # Create placeholder if log missing
-          if [ ! -f deployment.log ]; then
-            echo "Deployment step skipped or failed to start." > deployment.log
-          fi
-          
-          # Force add ignored file
+          # Force add log file
           git add -f deployment.log
           
-          # Only commit if there are changes
+          # Commit if changed
           if git diff --staged --quiet; then
             echo "No changes to deployment log."
           else
@@ -82,15 +91,17 @@ jobs:
             git push origin HEAD:${{ github.ref_name }}
           fi
 
-      - name: Check Deployment Status
+      - name: Report Status
         if: always()
         run: |
           if [ -z "$EXIT_CODE" ]; then
-             echo "Deployment step did not run."
+             echo "Unknown error: Exit code not set."
              exit 1
           fi
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "Deployment failed with exit code $EXIT_CODE"
+            echo "Workflow failed at stage: $FAILED_STAGE with exit code $EXIT_CODE"
             exit $EXIT_CODE
+          else
+            echo "Deployment successful!"
           fi
