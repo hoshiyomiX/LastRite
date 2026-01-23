@@ -40,8 +40,6 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           # Run deployment and capture output
-          # using '|| true' to proceed to logging step even on failure, 
-          # but we capture the exit status
           set +e
           npx wrangler deploy > deployment.log 2>&1
           EXIT_CODE=$?
@@ -62,7 +60,12 @@ jobs:
           # Pull latest to avoid conflict
           git pull origin ${{ github.ref_name }} --rebase || true
           
-          # Force add because *.log is usually ignored in .gitignore
+          # Create placeholder if log missing (e.g. if npm ci failed)
+          if [ ! -f deployment.log ]; then
+            echo "Deployment step skipped or failed to start." > deployment.log
+          fi
+          
+          # Force add ignored file
           git add -f deployment.log
           
           # Only commit if there are changes
@@ -76,6 +79,11 @@ jobs:
       - name: Check Deployment Status
         if: always()
         run: |
+          if [ -z "$EXIT_CODE" ]; then
+             echo "Deployment step did not run."
+             exit 1
+          fi
+
           if [ "$EXIT_CODE" -ne 0 ]; then
             echo "Deployment failed with exit code $EXIT_CODE"
             exit $EXIT_CODE
