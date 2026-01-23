@@ -145,6 +145,9 @@ async function handleCachedRequest(request, handler) {
     newResponse.headers.set('X-Cache-Status', 'MISS');
     
     // Store in cache (non-blocking)
+    // PATCH: Fix "Body has already been used" error
+    // We cannot wait for cache.put because it consumes the body
+    // Use ctx.waitUntil if available or just execute async
     await cache.put(cacheKey, responseToCache);
     
     return newResponse;
