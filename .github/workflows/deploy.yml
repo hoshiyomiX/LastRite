@@ -48,8 +48,19 @@ jobs:
         run: |
           # Run deployment and capture output
           set +e
-          npx wrangler deploy > deployment.log 2>&1
+          
+          echo "=== START CLEAN DEPLOY ===" > deployment.log
+          
+          # Optional: Delete existing worker to clear history/state (Fresh Deploy)
+          # Ignoring errors (e.g. if worker doesn't exist yet)
+          echo "Step 1: Deleting existing worker..." >> deployment.log
+          npx wrangler delete --force >> deployment.log 2>&1
+          
+          # Deploy new version
+          echo -e "\nStep 2: Deploying new version..." >> deployment.log
+          npx wrangler deploy >> deployment.log 2>&1
           EXIT_CODE=$?
+          
           set -e
           
           # Output to console for visibility
