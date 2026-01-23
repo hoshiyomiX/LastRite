@@ -1,1 +1,19 @@
-Deployment step skipped or failed to start.
+
+ ⛅️ wrangler 3.114.17 (update available 4.60.0)
+-----------------------------------------------
+
+[33m▲ [43;33m[[43;30mWARNING[43;33m][0m [1mThe version of Wrangler you are using is now out-of-date.[0m
+
+  Please update to the latest version to prevent critical errors.
+  Run `npm install --save-dev wrangler@4` to update to the latest version.
+  After installation, run Wrangler with `npx wrangler`.
+
+
+Total Upload: 55.39 KiB / gzip: 13.26 KiB
+No bindings found.
+Uploaded lastrite (1.68 sec)
+Deployed lastrite triggers (1.02 sec)
+  https://lastrite.katahiranaruse-daydream.workers.dev
+Current Version ID: 2fb587a6-f0d8-4c30-9a80-df82b1635fe3
+
+Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more at https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler/telemetry.md
