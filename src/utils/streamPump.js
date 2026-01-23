@@ -11,11 +11,10 @@ import {
   WATERMARK_BULK,
   COALESCE_THRESHOLD,
   COALESCE_MAX_SIZE,
-  COALESCE_TIMEOUT,
-  TIMEOUT_DEFAULT
+  COALESCE_TIMEOUT
 } from '../config/constants.js';
 import { bufferStats, batchStats } from '../core/state.js';
-import { calculateAdaptiveTimeout, returnToPool } from './network.js';
+import { returnToPool } from './network.js';
 
 export function safeCloseWebSocket(socket) {
   try {
@@ -28,7 +27,7 @@ export function safeCloseWebSocket(socket) {
 }
 
 // OPTIMIZATION 15 Phase 2: Intelligent chunk batching with adaptive watermark
-// OPTIMIZATION 13 & 14: Enhanced remoteSocketToWS with adaptive buffer management and timeout
+// OPTIMIZATION 13: Enhanced remoteSocketToWS with adaptive buffer management
 export async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log, targetAddress, targetPort) {
   let header = responseHeader;
   let hasIncomingData = false;
@@ -40,11 +39,9 @@ export async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, 
   let batchSize = 0;
   let batchTimeout = null;
   
-  // OPTIMIZATION 14: Use adaptive timeout for socket reads
-  const adaptiveTimeout = targetAddress ? calculateAdaptiveTimeout(targetAddress, targetPort, log) : TIMEOUT_DEFAULT;
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Socket read timeout (${adaptiveTimeout}ms)`)), adaptiveTimeout)
-  );
+  // FIX: Removed incorrect timeout race condition that was killing long-lived streams
+  // The connection timeout is already handled in tcp.js during handshake.
+  // We do not want to hard-limit the duration of an active stream.
 
   // OPTIMIZATION 15 Phase 2: Smart batch flush
   const flushBatch = async () => {
@@ -122,90 +119,88 @@ export async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, 
   };
 
   try {
-    await Promise.race([
-      remoteSocket.readable.pipeTo(
-        new WritableStream({
-          start() {},
-          async write(chunk, controller) {
-            hasIncomingData = true;
-            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-              controller.error("webSocket.readyState is not open, maybe close");
-            }
+    // FIX: Directly await the pipe operation without racing against a timeout
+    await remoteSocket.readable.pipeTo(
+      new WritableStream({
+        start() {},
+        async write(chunk, controller) {
+          hasIncomingData = true;
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            controller.error("webSocket.readyState is not open, maybe close");
+          }
+          
+          let dataToSend = chunk;
+          if (header) {
+            dataToSend = await new Blob([header, chunk]).arrayBuffer();
+            header = null;
+          }
+          
+          // OPTIMIZATION 13: Queue with limit check
+          if (bufferQueue.length >= MAX_QUEUE_SIZE) {
+            bufferStats.queueOverflows++;
+            if(log) log(`Queue overflow, dropping old chunks`);
+            bufferQueue.shift();
+          }
+          
+          // OPTIMIZATION 15 Phase 2: Decide whether to batch or send immediately
+          const chunkSize = dataToSend.byteLength || dataToSend.length;
+          const isInteractive = bytesTransferred < THRESHOLD_MEDIUM;
+          const shouldBatch = !isInteractive && chunkSize < COALESCE_THRESHOLD;
+          
+          if (shouldBatch) {
+            // Add to batch
+            batchBuffer.push(dataToSend);
+            batchSize += chunkSize;
             
-            let dataToSend = chunk;
-            if (header) {
-              dataToSend = await new Blob([header, chunk]).arrayBuffer();
-              header = null;
-            }
-            
-            // OPTIMIZATION 13: Queue with limit check
-            if (bufferQueue.length >= MAX_QUEUE_SIZE) {
-              bufferStats.queueOverflows++;
-              if(log) log(`Queue overflow, dropping old chunks`);
-              bufferQueue.shift();
-            }
-            
-            // OPTIMIZATION 15 Phase 2: Decide whether to batch or send immediately
-            const chunkSize = dataToSend.byteLength || dataToSend.length;
-            const isInteractive = bytesTransferred < THRESHOLD_MEDIUM;
-            const shouldBatch = !isInteractive && chunkSize < COALESCE_THRESHOLD;
-            
-            if (shouldBatch) {
-              // Add to batch
-              batchBuffer.push(dataToSend);
-              batchSize += chunkSize;
-              
-              // Flush batch if:
-              // 1. Batch size exceeds max
-              // 2. Set timeout for time-based flush (if not already set)
-              if (batchSize >= COALESCE_MAX_SIZE) {
-                await flushBatch();
-              } else if (!batchTimeout) {
-                batchTimeout = setTimeout(async () => {
-                  await flushBatch();
-                  await flushBuffer();
-                }, COALESCE_TIMEOUT);
-              }
-            } else {
-              // Large chunk or interactive mode: flush batch first, then send immediately
+            // Flush batch if:
+            // 1. Batch size exceeds max
+            // 2. Set timeout for time-based flush (if not already set)
+            if (batchSize >= COALESCE_MAX_SIZE) {
               await flushBatch();
-              bufferQueue.push(dataToSend);
-              bufferStats.totalQueued++;
-              bufferStats.maxQueueDepth = Math.max(bufferStats.maxQueueDepth, bufferQueue.length);
+            } else if (!batchTimeout) {
+              batchTimeout = setTimeout(async () => {
+                await flushBatch();
+                await flushBuffer();
+              }, COALESCE_TIMEOUT);
             }
-            
-            await flushBuffer();
-          },
-          close() {
-            if(log) log(`remoteConnection closed. Transferred: ${(bytesTransferred/1024/1024).toFixed(2)}MB`);
-            
-            // Flush any remaining data
-            flushBatch().then(() => flushBuffer()).then(() => {
-              // Return connection to pool if it's still healthy
-              if (hasIncomingData && targetAddress && targetPort && !remoteSocket.closed) {
-                returnToPool(remoteSocket, targetAddress, targetPort, log);
-                shouldReturnToPool = false;
-              }
-            }).catch(() => {});
-          },
-          abort(reason) {
-            console.error(`remoteConnection abort`, reason);
-            if (batchTimeout) clearTimeout(batchTimeout);
-            batchBuffer = [];
-            bufferQueue.length = 0;
-            shouldReturnToPool = false;
-          },
-        }),
-        {
-          // OPTIMIZATION 15 Phase 1: Adaptive watermark based on transfer size
-          highWaterMark: bytesTransferred > THRESHOLD_BULK ? WATERMARK_BULK :
-                         bytesTransferred > THRESHOLD_MEDIUM ? WATERMARK_BALANCED :
-                         WATERMARK_INTERACTIVE,
-          size: chunk => chunk.byteLength || chunk.length
-        }
-      ),
-      timeoutPromise,
-    ]);
+          } else {
+            // Large chunk or interactive mode: flush batch first, then send immediately
+            await flushBatch();
+            bufferQueue.push(dataToSend);
+            bufferStats.totalQueued++;
+            bufferStats.maxQueueDepth = Math.max(bufferStats.maxQueueDepth, bufferQueue.length);
+          }
+          
+          await flushBuffer();
+        },
+        close() {
+          if(log) log(`remoteConnection closed. Transferred: ${(bytesTransferred/1024/1024).toFixed(2)}MB`);
+          
+          // Flush any remaining data
+          flushBatch().then(() => flushBuffer()).then(() => {
+            // Return connection to pool if it's still healthy
+            if (hasIncomingData && targetAddress && targetPort && !remoteSocket.closed) {
+              returnToPool(remoteSocket, targetAddress, targetPort, log);
+              shouldReturnToPool = false;
+            }
+          }).catch(() => {});
+        },
+        abort(reason) {
+          console.error(`remoteConnection abort`, reason);
+          if (batchTimeout) clearTimeout(batchTimeout);
+          batchBuffer = [];
+          bufferQueue.length = 0;
+          shouldReturnToPool = false;
+        },
+      }),
+      {
+        // OPTIMIZATION 15 Phase 1: Adaptive watermark based on transfer size
+        highWaterMark: bytesTransferred > THRESHOLD_BULK ? WATERMARK_BULK :
+                       bytesTransferred > THRESHOLD_MEDIUM ? WATERMARK_BALANCED :
+                       WATERMARK_INTERACTIVE,
+        size: chunk => chunk.byteLength || chunk.length
+      }
+    );
     
     // Final flush
     await flushBatch();
