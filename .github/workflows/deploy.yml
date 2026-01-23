@@ -62,7 +62,8 @@ jobs:
           # Pull latest to avoid conflict
           git pull origin ${{ github.ref_name }} --rebase || true
           
-          git add deployment.log
+          # Force add because *.log is usually ignored in .gitignore
+          git add -f deployment.log
           
           # Only commit if there are changes
           if git diff --staged --quiet; then
