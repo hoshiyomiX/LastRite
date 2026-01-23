@@ -22,11 +22,14 @@ export async function websocketHandler(request, prxIP) {
 
   webSocket.accept();
 
-  let addressLog = "";
-  let portLog = "";
+  // Optimization: Disable logging in production for performance
+  // Only create strings if we are debugging or encountering errors
+  const addressLog = ""; 
+  const portLog = "";
   const log = (info, event) => {
-    console.log(`[${addressLog}:${portLog}] ${info}`, event || "");
+    // console.log(`[${addressLog}:${portLog}] ${info}`, event || "");
   };
+  
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
 
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
@@ -68,15 +71,22 @@ export async function websocketHandler(request, prxIP) {
           } else if (protocol === "ss") {
             protocolHeader = readSsHeader(chunk);
           } else {
-            throw new Error("Unknown Protocol!");
+            // Unrecognized protocol - don't throw, just close
+            // throw new Error("Unknown Protocol!");
+            console.error(`Unknown Protocol detected, closing connection`);
+            safeCloseWebSocket(webSocket);
+            return;
           }
-
-          addressLog = protocolHeader.addressRemote;
-          portLog = `${protocolHeader.portRemote} -> ${protocolHeader.isUDP ? "UDP" : "TCP"}`;
 
           if (protocolHeader.hasError) {
-            throw new Error(protocolHeader.message);
+             // throw new Error(protocolHeader.message);
+             console.error(`Protocol Error: ${protocolHeader.message}`);
+             safeCloseWebSocket(webSocket);
+             return;
           }
+
+          // addressLog = protocolHeader.addressRemote;
+          // portLog = `${protocolHeader.portRemote} -> ${protocolHeader.isUDP ? "UDP" : "TCP"}`;
 
           if (protocolHeader.isUDP) {
             if (protocolHeader.portRemote === 53) {
@@ -111,7 +121,7 @@ export async function websocketHandler(request, prxIP) {
             webSocket,
             protocolHeader.version,
             log,
-            prxIP
+            prxIP // This is the proxy override IP passed from index.js
           );
         },
         close() {
@@ -151,6 +161,8 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         controller.close();
       });
       webSocketServer.addEventListener("error", (err) => {
+        // Only log serious errors
+        /*
         log("WebSocket error:", {
           message: err.message || 'Unknown error',
           type: err.type || 'Unknown type',
@@ -158,6 +170,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
           readyState: webSocketServer.readyState,
           timestamp: new Date().toISOString()
         });
+        */
         controller.error(err);
       });
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
