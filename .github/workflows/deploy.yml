@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - refactor-modular
-      # - main # Disabled push trigger on main
+      # - main # Push trigger disabled for default branch to prevent accidental deployments
   pull_request:
     branches:
       - main
