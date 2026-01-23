@@ -3,6 +3,7 @@ import { getFlagEmojiCached } from '../utils/helpers.js';
 import { PROTOCOL_HORSE, PROTOCOL_FLASH, PROTOCOL_V2 } from '../config/constants.js';
 
 // OPTIMIZATION 11: Streaming response generator
+// OPTIMIZATION 19: Use String Interpolation instead of URL objects for massive perf gain
 export async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, appDomain, serviceName) {
   let configCount = 0;
   
@@ -10,16 +11,17 @@ export async function* generateConfigsStream(prxList, filterPort, filterVPN, fil
   streamingStats.activeStreams++;
   streamingStats.totalStreamed++;
   
-  // Create base URL once
-  const baseUri = new URL(`${PROTOCOL_HORSE}://${fillerDomain}`);
-  baseUri.searchParams.set("encryption", "none");
-  baseUri.searchParams.set("type", "ws");
-  baseUri.searchParams.set("host", appDomain);
-  
+  // Pre-calculate common parts
+  const isFlashEmptySNI = (port) => port === 80;
+
   for (const prx of prxList) {
     if (configCount >= filterLimit) break;
     
+    // Cache emoji lookup
+    const flagEmoji = getFlagEmojiCached(prx.country);
+    const cleanOrg = prx.org || "Unknown";
     const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+    const encodedProxyPath = encodeURIComponent(proxyPath);
 
     for (const port of filterPort) {
       if (configCount >= filterLimit) break;
@@ -30,27 +32,32 @@ export async function* generateConfigsStream(prxList, filterPort, filterVPN, fil
       
       for (const protocol of filterVPN) {
         if (configCount >= filterLimit) break;
-
-        baseUri.protocol = protocol;
-        baseUri.port = port.toString();
-        baseUri.searchParams.set("security", security);
-        baseUri.searchParams.set("path", proxyPath);
         
+        // Base config name
+        const hashName = encodeURIComponent(`${configCount + 1} ${flagEmoji} ${cleanOrg} WS ${tlsLabel} [${serviceName}]`);
+        let configStr = "";
+
         if (protocol === "ss") {
-          baseUri.username = ssUsername;
-          baseUri.searchParams.set(
-            "plugin",
+          // Shadowsocks URL format: ss://base64(method:password)@server:port?plugin=...#name
+          const pluginParam = encodeURIComponent(
             `${PROTOCOL_V2}-plugin${isTLS ? ";tls" : ""};mux=0;mode=websocket;path=${proxyPath};host=${appDomain}`
           );
+          configStr = `${protocol}://${ssUsername}@${fillerDomain}:${port}?plugin=${pluginParam}#${hashName}`;
         } else {
-          baseUri.username = uuid;
-          baseUri.searchParams.delete("plugin");
+          // Standard V2Ray/Trojan/Vmess URL format
+          // protocol://uuid@host:port?params#name
+          
+          let params = `security=${security}&type=ws&host=${appDomain}&path=${encodedProxyPath}&encryption=none`;
+          
+          // SNI handling
+          const sni = (port === 80 && protocol === PROTOCOL_FLASH) ? "" : appDomain;
+          if (sni) {
+            params += `&sni=${sni}`;
+          }
+
+          configStr = `${protocol}://${uuid}@${fillerDomain}:${port}?${params}#${hashName}`;
         }
 
-        baseUri.searchParams.set("sni", (port === 80 && protocol === PROTOCOL_FLASH) ? "" : appDomain);
-        baseUri.hash = `${configCount + 1} ${getFlagEmojiCached(prx.country)} ${prx.org} WS ${tlsLabel} [${serviceName}]`;
-        
-        const configStr = baseUri.toString();
         streamingStats.streamingBytes += configStr.length;
         
         // Yield each config as it's generated
