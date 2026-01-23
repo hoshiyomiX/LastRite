@@ -1,17 +1,6 @@
-name = "last-rite"
-main = "_worker.js"
-compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat_v2"]
+name = "lastrite"
+main = "src/index.js"
+compatibility_date = "2024-03-29"
 
-# Custom domains
-routes = [
-  { pattern = "hoshiyomi.qzz.io", custom_domain = true },
-  { pattern = "hoshiyomi.web.id", custom_domain = true },
-  { pattern = "belajar.ruangguru.com.hoshiyomi.qzz.io", custom_domain = true },
-  { pattern = "api24-normal.tiktokv.com.hoshiyomi.qzz.io", custom_domain = true }
-]
-
-# Enable logs temporarily for debugging
-[observability.logs]
+[observability]
 enabled = true
-invocation_logs = true
