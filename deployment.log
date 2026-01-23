@@ -1,3 +1,21 @@
+=== START CLEAN DEPLOY ===
+Step 1: Deleting existing worker...
+
+ ⛅️ wrangler 3.114.17 (update available 4.60.0)
+-----------------------------------------------
+
+[33m▲ [43;33m[[43;30mWARNING[43;33m][0m [1mThe version of Wrangler you are using is now out-of-date.[0m
+
+  Please update to the latest version to prevent critical errors.
+  Run `npm install --save-dev wrangler@4` to update to the latest version.
+  After installation, run Wrangler with `npx wrangler`.
+
+
+Successfully deleted lastrite
+
+Step 2: Deploying new version...
+
+Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more at https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler/telemetry.md
 
  ⛅️ wrangler 3.114.17 (update available 4.60.0)
 -----------------------------------------------
@@ -11,9 +29,7 @@
 
 Total Upload: 56.00 KiB / gzip: 13.49 KiB
 No bindings found.
-Uploaded lastrite (4.72 sec)
-Deployed lastrite triggers (0.31 sec)
+Uploaded lastrite (2.56 sec)
+Deployed lastrite triggers (1.88 sec)
   https://lastrite.katahiranaruse-daydream.workers.dev
-Current Version ID: 9b8483f4-3a6e-4630-baaa-fd0869f3a9b9
-
-Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more at https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler/telemetry.md
+Current Version ID: 0e604e74-c7a4-4323-a9c5-316e1ca7b3df
