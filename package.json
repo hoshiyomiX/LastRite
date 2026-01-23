@@ -10,6 +10,5 @@
   "author": "HoshiyomiX",
   "license": "ISC",
   "dependencies": {
-    "cloudflare:sockets": "latest"
   }
 }
