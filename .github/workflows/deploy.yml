@@ -6,8 +6,8 @@ permissions:
 on:
   push:
     branches:
-      - main
       - refactor-modular
+      # - main # Disabled push trigger on main
   pull_request:
     branches:
       - main
