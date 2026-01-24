@@ -31,23 +31,40 @@ function processProxies(proxies) {
   
   // Format: IP,Port,CC,Org
   const processed = proxies.map(p => {
-    // monosans/proxy-list json format typically uses:
-    // "ip": "1.2.3.4", "port": 8080, "protocol": "http", ...
-    // BUT sometimes field names vary. Let's handle common cases.
+    // Monosans structure: {"ip": "...", "port": ..., "protocol": "http", "country": {"code": "US", "name": "United States"}, "as": {"number": 123, "name": "Google", "organization": "Google LLC"}}
+    // OR sometimes flat structure depending on the exact file. 
+    // Let's handle nested objects carefully.
     
-    // Fallback logic if structure is different
     const ip = p.ip || p.host || p.address;
     const port = p.port;
-    const country = p.country || (p.geolocation && p.geolocation.country) || 'XX';
-    const orgRaw = p.org || p.isp || (p.geolocation && p.geolocation.isp) || 'Unknown';
     
+    // Handle Country (nested object or string)
+    let cc = 'XX';
+    if (typeof p.country === 'object' && p.country !== null) {
+      cc = p.country.code || 'XX';
+    } else if (typeof p.country === 'string') {
+      cc = p.country;
+    } else if (p.geolocation && p.geolocation.country) {
+      cc = p.geolocation.country;
+    }
+
+    // Handle Org/AS (nested object or string)
+    let orgRaw = 'Unknown';
+    if (typeof p.as === 'object' && p.as !== null) {
+      orgRaw = p.as.organization || p.as.name || 'Unknown';
+    } else if (p.org) {
+      orgRaw = p.org;
+    } else if (p.isp) {
+      orgRaw = p.isp;
+    }
+
     // Sanitize
     const org = String(orgRaw).replace(/,/g, ' ').trim();
     const safeIP = String(ip).trim();
     const safePort = String(port).trim();
-    const safeCC = String(country).trim();
+    const safeCC = String(cc).trim();
     
-    if (!safeIP || safeIP === 'undefined') {
+    if (!safeIP || safeIP === 'undefined' || safeIP === '[object Object]') {
       return null; // Invalid item
     }
 
