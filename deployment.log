@@ -19,7 +19,7 @@ Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more
  ⛅️ wrangler 4.60.0
 ───────────────────
 Total Upload: 55.34 KiB / gzip: 13.38 KiB
-Uploaded aegir (1.49 sec)
-Deployed aegir triggers (1.13 sec)
+Uploaded aegir (1.39 sec)
+Deployed aegir triggers (0.79 sec)
   https://aegir.katahiranaruse-daydream.workers.dev
-Current Version ID: d7329916-ccee-46d5-90ee-657dd6b6b293
+Current Version ID: f471459d-a1b6-4c47-a570-fe771d51d9e5
