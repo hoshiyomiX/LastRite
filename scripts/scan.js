@@ -6,8 +6,8 @@ const PROXY_LIST_FILE = 'proxyList.txt';
 const KV_PROXY_LIST_FILE = 'kvProxyList.json';
 
 // Configuration
-const MAX_PROXIES_TOTAL = 2000; // Limit total proxies to keep file size manageable
-const MAX_PROXIES_PER_COUNTRY = 50; // Limit for KV list to ensure variety
+const MAX_PROXIES_TOTAL = 2000;
+const MAX_PROXIES_PER_COUNTRY = 50;
 
 async function fetchProxies() {
   console.log(`[Scan] Fetching proxies from ${MONOSANS_URL}...`);
@@ -24,25 +24,41 @@ async function fetchProxies() {
 }
 
 function processProxies(proxies) {
-  // Filter and map
-  // We prefer HTTPS/SOCKS5 if available, but monosans mixes them. 
-  // For Aegir "ProxyIP" usage, we usually look for robust IPs.
-  // Since we can't easily validte "Cloudflare-ness" here without a complex check,
-  // we will trust the list but prioritize by latency if available (monosans json usually has no latency field in raw, wait, proxies_pretty might not have latency, checking docs...)
-  // Checking monosans structure: usually ip, port, protocol, country, org, isp.
-  // We will assume the list is somewhat usable.
+  // Debug one item to check structure
+  if (proxies.length > 0) {
+    console.log('[Scan] Sample proxy item:', JSON.stringify(proxies[0]));
+  }
   
   // Format: IP,Port,CC,Org
   const processed = proxies.map(p => {
-    const org = (p.org || p.isp || 'Unknown').replace(/,/g, ' ').trim(); // Remove commas for CSV safety
+    // monosans/proxy-list json format typically uses:
+    // "ip": "1.2.3.4", "port": 8080, "protocol": "http", ...
+    // BUT sometimes field names vary. Let's handle common cases.
+    
+    // Fallback logic if structure is different
+    const ip = p.ip || p.host || p.address;
+    const port = p.port;
+    const country = p.country || (p.geolocation && p.geolocation.country) || 'XX';
+    const orgRaw = p.org || p.isp || (p.geolocation && p.geolocation.isp) || 'Unknown';
+    
+    // Sanitize
+    const org = String(orgRaw).replace(/,/g, ' ').trim();
+    const safeIP = String(ip).trim();
+    const safePort = String(port).trim();
+    const safeCC = String(country).trim();
+    
+    if (!safeIP || safeIP === 'undefined') {
+      return null; // Invalid item
+    }
+
     return {
-      ip: p.ip,
-      port: p.port,
-      cc: p.country || 'XX',
+      ip: safeIP,
+      port: safePort,
+      cc: safeCC,
       org: org,
-      line: `${p.ip},${p.port},${p.country || 'XX'},${org}`
+      line: `${safeIP},${safePort},${safeCC},${org}`
     };
-  });
+  }).filter(Boolean); // Remove nulls
 
   return processed;
 }
@@ -52,7 +68,6 @@ async function run() {
   const processed = processProxies(rawProxies);
 
   // 1. Generate proxyList.txt (CSV)
-  // Limit total size
   const listContent = processed
     .slice(0, MAX_PROXIES_TOTAL)
     .map(p => p.line)
@@ -68,7 +83,6 @@ async function run() {
     const cc = p.cc.toUpperCase();
     if (!kvMap[cc]) kvMap[cc] = [];
     
-    // Limit per country for KV to save space and ensure distribution
     if (kvMap[cc].length < MAX_PROXIES_PER_COUNTRY) {
       kvMap[cc].push(`${p.ip}:${p.port}`);
     }
