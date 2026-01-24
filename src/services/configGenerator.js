@@ -7,20 +7,34 @@ import { PROTOCOL_HORSE, PROTOCOL_FLASH, PROTOCOL_V2 } from '../config/constants
 export async function* generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, appDomain, serviceName) {
   let configCount = 0;
   
-  console.log(`[Streaming] Starting config generation (OPT-11 active): ${prxList.length} proxies`);
+  // REMOVED LOGGING to prevent CPU time limit issues
   streamingStats.activeStreams++;
   streamingStats.totalStreamed++;
   
   // Pre-calculate common parts
   const isFlashEmptySNI = (port) => port === 80;
 
+  // IMPORTANT: Ensure prxList is an array and has items
+  if (!Array.isArray(prxList)) {
+    return; // Exit stream if invalid data
+  }
+
   for (const prx of prxList) {
     if (configCount >= filterLimit) break;
     
-    // Cache emoji lookup
-    const flagEmoji = getFlagEmojiCached(prx.country);
+    // SAFE ACCESS: Check if properties exist
+    const country = prx.country || "XX";
     const cleanOrg = prx.org || "Unknown";
-    const proxyPath = `/${prx.prxIP}-${prx.prxPort}`;
+    const proxyIP = prx.prxIP; // Ensure this field exists in your proxy provider object!
+    const proxyPort = prx.prxPort;
+
+    if (!proxyIP || !proxyPort) continue; // Skip invalid proxy objects
+
+    // Cache emoji lookup
+    const flagEmoji = getFlagEmojiCached(country);
+    
+    // Path MUST be constructed carefully
+    const proxyPath = `/${proxyIP}-${proxyPort}`;
     const encodedProxyPath = encodeURIComponent(proxyPath);
 
     for (const port of filterPort) {
@@ -68,7 +82,6 @@ export async function* generateConfigsStream(prxList, filterPort, filterVPN, fil
   }
   
   streamingStats.activeStreams--;
-  console.log(`[Streaming] Completed: ${configCount} configs, ${(streamingStats.streamingBytes/1024).toFixed(2)}KB total`);
 }
 
 export function createStreamingResponse(asyncGenerator, responseHeaders) {
@@ -87,7 +100,8 @@ export function createStreamingResponse(asyncGenerator, responseHeaders) {
         }
         controller.close();
       } catch (err) {
-        controller.error(err);
+        // Safe stream closure on error
+        try { controller.close(); } catch(e) {}
       }
     },
   });
