@@ -25,7 +25,70 @@ import { generateConfigsStream, createStreamingResponse } from './services/confi
 import { reverseWeb } from './services/httpReverse.js';
 import { prewarmDNS, cleanupDNSCache, fetchWithDNS } from './services/dns.js';
 
-// Helper functions (kept inline)
+function getWebUI() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegir WebUI</title>
+<style>
+:root { --accent: #00f2ea; --bg: #050505; --panel: #111; --text: #eee; }
+body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+.card { background: var(--panel); padding: 2rem; border-radius: 12px; border: 1px solid #222; width: 100%; max-width: 420px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+h2 { text-align: center; color: var(--accent); margin-top: 0; }
+label { display: block; margin: 10px 0 5px; font-size: 0.9em; color: #aaa; }
+input, select, button { width: 100%; padding: 12px; background: #222; border: 1px solid #333; color: white; border-radius: 6px; margin-bottom: 5px; font-size: 14px; box-sizing: border-box; }
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+button { background: var(--accent); color: black; font-weight: bold; cursor: pointer; border: none; margin-top: 15px; }
+button:hover { opacity: 0.9; }
+.result { margin-top: 20px; padding: 10px; background: #000; border-radius: 6px; font-family: monospace; font-size: 12px; word-break: break-all; display: none; color: #0f0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Aegir WebUI</h2>
+  <label>Target Domain (SNI)</label>
+  <input id="sni" type="text" placeholder="example.com">
+  
+  <label>Config Format</label>
+  <select id="fmt">
+    <option value="raw">Raw (Clash/Meta)</option>
+    <option value="v2ray">V2Ray / Xray</option>
+    <option value="clash">Clash Provider</option>
+  </select>
+
+  <button onclick="gen()">Generate Link</button>
+  <div id="out" class="result"></div>
+</div>
+<script>
+  // Initialize
+  document.getElementById('sni').value = window.location.hostname;
+
+  function gen() {
+    var sni = document.getElementById('sni').value || window.location.hostname;
+    var fmt = document.getElementById('fmt').value;
+    var origin = window.location.origin;
+    var url = "";
+
+    if (fmt === 'clash') {
+      url = origin + '/sub?host=' + sni + '&format=clash';
+    } else if (fmt === 'v2ray') {
+      url = origin + '/api/v1/sub?host=' + sni + '&format=v2ray';
+    } else {
+      url = origin + '/api/v1/sub?host=' + sni + '&format=raw';
+    }
+
+    var out = document.getElementById('out');
+    out.innerText = url;
+    out.style.display = 'block';
+  }
+</script>
+</body>
+</html>`;
+}
+
+// Helper functions
 function getRequestKey(request) {
   const url = new URL(request.url);
   const params = new URLSearchParams();
@@ -136,8 +199,7 @@ export default {
 
       // ROUTING LOGIC
       if (url.pathname === "/" || url.pathname === "/sub") {
-        const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Aegir Generator</title><style>:root{--primary:#00f2ea;--secondary:#ff0050;--bg:#0a0a0a;--surface:#161616;--text:#ffffff;--muted:#888888}*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',sans-serif}body{background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}.container{background:var(--surface);padding:2rem;border-radius:16px;width:100%;max-width:500px;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid #333}h1{text-align:center;margin-bottom:2rem;background:linear-gradient(45deg,var(--primary),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:800}.form-group{margin-bottom:1.5rem}label{display:block;margin-bottom:0.5rem;color:var(--muted);font-size:0.9rem}input,select{width:100%;padding:12px;background:#222;border:1px solid #333;border-radius:8px;color:var(--text);font-size:1rem;transition:0.3s}input:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(0,242,234,0.2)}button{width:100%;padding:14px;background:linear-gradient(45deg,var(--primary),#00c2bb);border:none;border-radius:8px;color:#000;font-weight:bold;font-size:1.1rem;cursor:pointer;transition:0.3s}button:hover{transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,242,234,0.3)}#result{margin-top:1.5rem;padding:1rem;background:#222;border-radius:8px;word-break:break-all;display:none;position:relative}.copy-btn{position:absolute;top:5px;right:5px;background:#444;color:#fff;padding:4px 8px;font-size:0.8rem;width:auto}</style></head><body><div class="container"><h1>Aegir Generator 🌊</h1><div class="form-group"><label>Domain / SNI</label><input type="text" id="domain" placeholder="example.com" value=""></div><div class="form-group"><label>Format</label><select id="format"><option value="raw">Raw (Clash/Meta)</option><option value="v2ray">V2Ray (Base64)</option><option value="clash">Clash Provider</option></select></div><button onclick="generateLink()">Generate Link</button><div id="result"><button class="copy-btn" onclick="copyToClipboard()">Copy</button><code id="output"></code></div></div><script>document.getElementById('domain').value=window.location.hostname;function generateLink(){const domain=document.getElementById('domain').value;const format=document.getElementById('format').value;const origin=window.location.origin;let finalUrl="";if(format==='clash'){finalUrl=origin+"/sub?host="+domain+"&format=clash"}else if(format==='v2ray'){finalUrl=origin+"/api/v1/sub?host="+domain+"&format=v2ray"}else{finalUrl=origin+"/api/v1/sub?host="+domain+"&format=raw"}document.getElementById('output').innerText=finalUrl;document.getElementById('result').style.display='block'}function copyToClipboard(){const text=document.getElementById('output').innerText;navigator.clipboard.writeText(text).then(()=>{const btn=document.querySelector('.copy-btn');btn.innerText='Copied!';setTimeout(()=>btn.innerText='Copy',2000)})}</script></body></html>`;
-        return new Response(html, { 
+        return new Response(getWebUI(), { 
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             "Cache-Control": "public, max-age=3600"
