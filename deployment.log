@@ -1,7 +1,7 @@
 === START CLEAN DEPLOY ===
 Step 0: Installing Dependencies...
 
-up to date, audited 1 package in 460ms
+up to date, audited 1 package in 478ms
 
 found 0 vulnerabilities
 
@@ -18,8 +18,8 @@ Cloudflare collects anonymous telemetry about your usage of Wrangler. Learn more
 
  ⛅️ wrangler 4.60.0
 ───────────────────
-Total Upload: 55.80 KiB / gzip: 14.22 KiB
-Uploaded aegir (1.69 sec)
-Deployed aegir triggers (0.65 sec)
+Total Upload: 55.21 KiB / gzip: 13.96 KiB
+Uploaded aegir (2.01 sec)
+Deployed aegir triggers (2.20 sec)
   https://aegir.katahiranaruse-daydream.workers.dev
-Current Version ID: c2f71fde-3469-467d-9235-be8d6e90235a
+Current Version ID: 918f073b-cf55-4373-9a35-b50af867c633
