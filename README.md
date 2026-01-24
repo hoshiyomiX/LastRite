@@ -75,6 +75,20 @@ Simply access your worker URL to start using it.
 
 ---
 
+## 🌐 Community & Proxy Resources
+
+Finding high-quality Proxy IPs is key to Aegir's performance.
+
+### Recommended Sources (Auto-Compatible)
+Aegir uses the standard `IP,Port,CC,Org` CSV format.
+1. **[CloudflareSpeedTest (XIU2)](https://github.com/XIU2/CloudflareSpeedTest)**: The gold standard for scanning clean IPs relative to your ISP.
+2. **[FoolVPN-ID/Nautica](https://github.com/FoolVPN-ID/Nautica)**: Maintains the default `proxyList.txt` used by this repo.
+3. **[vfarid/cf-ip-scanner](https://github.com/vfarid/cf-ip-scanner)**: Another excellent scanner for finding low-latency IPs.
+
+> **Tip**: For best results, scan your own IPs using CloudflareST and host your own `proxyList.txt` on GitHub!
+
+---
+
 ## 📄 License
 
 This project is licensed under the **ISC License**.
