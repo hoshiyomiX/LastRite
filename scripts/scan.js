@@ -5,7 +5,6 @@ const MONOSANS_URL = 'https://raw.githubusercontent.com/monosans/proxy-list/main
 const PROXY_LIST_FILE = 'proxyList.txt';
 const KV_PROXY_LIST_FILE = 'kvProxyList.json';
 
-// Configuration
 const MAX_PROXIES_TOTAL = 2000;
 const MAX_PROXIES_PER_COUNTRY = 50;
 
@@ -35,49 +34,36 @@ function processProxies(proxies) {
     // 2. Port Parsing
     const port = p.port;
     
-    // 3. Country Parsing (Aggressive Flattening)
+    // 3. Country Parsing (Deep Geolocation)
+    // Structure: p.geolocation.country.iso_code
     let cc = 'XX';
     try {
-      if (!p.country) {
-        cc = 'XX';
-      } else if (typeof p.country === 'string') {
-        cc = p.country;
-      } else if (typeof p.country === 'object') {
-        // Try common keys
-        cc = p.country.code || p.country.iso || p.country.id || p.country.name || 'XX';
-        
-        // Final sanity check: if it's STILL an object (e.g. nested deeper), force XX
-        if (typeof cc === 'object') {
-          console.warn('[Scan] Nested country object found, defaulting to XX:', JSON.stringify(p.country));
-          cc = 'XX';
+        if (p.geolocation && p.geolocation.country && p.geolocation.country.iso_code) {
+            cc = p.geolocation.country.iso_code;
+        } else if (p.country && typeof p.country === 'string') {
+            cc = p.country;
         }
-      }
-    } catch (e) {
-      cc = 'XX';
-    }
+    } catch (e) { cc = 'XX'; }
 
     // 4. Org/AS Parsing
+    // Structure: p.asn.autonomous_system_organization
     let orgRaw = 'Unknown';
     try {
-      if (p.org) orgRaw = p.org;
-      else if (p.isp) orgRaw = p.isp;
-      else if (p.as) {
-        if (typeof p.as === 'string') orgRaw = p.as;
-        else if (typeof p.as === 'object') {
-          orgRaw = p.as.organization || p.as.name || p.as.number || 'Unknown';
+        if (p.asn && p.asn.autonomous_system_organization) {
+            orgRaw = p.asn.autonomous_system_organization;
+        } else if (p.org) {
+            orgRaw = p.org;
+        } else if (p.isp) {
+            orgRaw = p.isp;
         }
-      }
-    } catch (e) {
-      orgRaw = 'Unknown';
-    }
+    } catch (e) { orgRaw = 'Unknown'; }
 
-    // 5. Sanitization (Crucial step)
+    // 5. Sanitization
     const safeIP = String(ip || '').trim();
     const safePort = String(port || '').trim();
-    const safeCC = String(cc || 'XX').trim().toUpperCase().substring(0, 2); // Force 2 chars
+    const safeCC = String(cc || 'XX').trim().toUpperCase().substring(0, 2);
     const safeOrg = String(orgRaw || 'Unknown').replace(/,/g, ' ').replace(/[\r\n]/g, '').trim();
     
-    // Validation
     if (!safeIP || safeIP === 'undefined' || safeIP === '[object Object]') return null;
     if (!safePort || isNaN(safePort)) return null;
 
