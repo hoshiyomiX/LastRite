@@ -24,10 +24,12 @@ import { getKVPrxList, getPrxListPaginated } from './services/proxyProvider.js';
 import { generateConfigsStream, createStreamingResponse } from './services/configGenerator.js';
 import { reverseWeb } from './services/httpReverse.js';
 import { prewarmDNS, cleanupDNSCache, fetchWithDNS } from './services/dns.js';
-// REMOVED: import indexHtml from './pages/index.html';
 
-// CONSTANT HTML CONTENT INLINE
-const INDEX_HTML = `<!DOCTYPE html>
+console.log("[Worker] Script loaded successfully");
+
+// MOVED TO FUNCTION to prevent Top-Level Exceptions from crashing the worker silently
+function getIndexHtml() {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -192,8 +194,9 @@ const INDEX_HTML = `<!DOCTYPE html>
     </script>
 </body>
 </html>`;
+}
 
-// Helper functions (kept inline for simplicity and integrity)
+// Helper functions (kept inline)
 function getRequestKey(request) {
   const url = new URL(request.url);
   const params = new URLSearchParams();
@@ -255,7 +258,7 @@ async function handleCachedRequest(request, handler) {
     const responseToCache = response.clone();
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('X-Cache-Status', 'MISS');
-    await cache.put(cacheKey, responseToCache); // Non-blocking in CF Workers often
+    await cache.put(cacheKey, responseToCache); 
     return newResponse;
   }
   return response;
@@ -277,11 +280,11 @@ function addCacheHeaders(headers, ttl = 3600, browserTTL = 1800) {
 export default {
   async fetch(request, env, ctx) {
     try {
+      console.log("[Worker] Request received: " + request.url);
       const url = new URL(request.url);
       const appDomain = url.hostname;
       const serviceName = appDomain.split(".")[0];
 
-      // Safe access to DNS cache map
       if (dnsCache && dnsCache.size === 0) ctx.waitUntil(prewarmDNS());
       if (Math.random() < 0.1) ctx.waitUntil(Promise.resolve().then(cleanupDNSCache));
 
@@ -307,7 +310,7 @@ export default {
       
       // 1. Root Path / Sub Path -> Serve Built-in Generator
       if (url.pathname === "/" || url.pathname === "/sub") {
-        return new Response(INDEX_HTML, { 
+        return new Response(getIndexHtml(), { 
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             "Cache-Control": "public, max-age=3600"
