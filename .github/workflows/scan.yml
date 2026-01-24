@@ -1,0 +1,39 @@
+name: Proxy Scanner
+
+on:
+  schedule:
+    - cron: '0 */4 * * *' # Run every 4 hours
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  scan-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      
+      - name: Run Scanner
+        run: node scripts/scan.js
+        
+      - name: Commit Results
+        run: |
+          git config --global user.name "Aegir Bot"
+          git config --global user.email "bot@aegir.local"
+          
+          git add proxyList.txt kvProxyList.json
+          
+          # Only commit if changed
+          if git diff --staged --quiet; then
+            echo "No changes to proxy list."
+          else
+            git commit -m "chore(data): Update proxy list from monosans source [skip ci]"
+            git push
+          fi
