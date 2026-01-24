@@ -25,26 +25,8 @@ import { generateConfigsStream, createStreamingResponse } from './services/confi
 import { reverseWeb } from './services/httpReverse.js';
 import { prewarmDNS, cleanupDNSCache, fetchWithDNS } from './services/dns.js';
 
-// SAFE HTML GENERATOR - NO BACKTICKS
-function getWebUI() {
-  var s = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Aegir Config</title>';
-  s += '<style>:root{--a:#00f2ea;--b:#050505;--p:#111;--t:#eee;--d:#333}body{font-family:sans-serif;background:var(--b);color:var(--t);display:flex;justify-content:center;min-height:100vh;margin:0;padding:10px}.card{background:var(--p);padding:1.5rem;border-radius:12px;border:1px solid var(--d);width:100%;max-width:400px;box-shadow:0 10px 30px #000}h2{text-align:center;color:var(--a);margin:0 0 15px}label{display:block;margin:8px 0 2px;font-size:0.8em;color:#888;font-weight:bold}input,select,button{width:100%;padding:10px;background:#222;border:1px solid var(--d);color:#fff;border-radius:6px;box-sizing:border-box}input:focus,select:focus{border-color:var(--a);outline:none}button{background:var(--a);color:#000;font-weight:bold;margin-top:15px;cursor:pointer}textarea{width:100%;height:100px;background:#000;color:#0f0;margin-top:15px;border:1px solid var(--d);font-family:monospace;font-size:10px}</style>';
-  s += '</head><body><div class="card"><h2>Aegir 🌊 v2.1</h2>';
-  s += '<div><label>Bug Address (IP/Host)</label><input id="bug" placeholder="Auto-detected"></div>';
-  s += '<div><label>SNI / WS Host</label><input id="sni" placeholder="Auto-detected"></div>';
-  s += '<div><label>Country (e.g. SG,ID)</label><input id="cc"></div>';
-  s += '<div><label>Limit</label><select id="limit"><option value="1">Single (1)</option><option value="10">List (10)</option><option value="50" selected>Bulk (50)</option></select></div>';
-  s += '<div><label>Format</label><select id="fmt"><option value="raw">Raw URI (VLESS/Trojan)</option><option value="v2ray">Base64 (V2Ray/Xray)</option><option value="clash">Clash Provider</option></select></div>';
-  s += '<button onclick="g()">Generate</button><textarea id="res" readonly></textarea></div>';
-  s += '<script>';
-  s += 'document.getElementById("sni").placeholder=location.hostname;document.getElementById("bug").placeholder=location.hostname;';
-  s += 'function g(){var bug=document.getElementById("bug").value||"";var sni=document.getElementById("sni").value||"";var cc=document.getElementById("cc").value;var lim=document.getElementById("limit").value;var fmt=document.getElementById("fmt").value;';
-  s += 'var p=new URLSearchParams();if(bug)p.append("domain",bug);if(sni)p.append("sni",sni);if(cc)p.append("cc",cc.toUpperCase());p.append("limit",lim);';
-  s += 'var ep="/api/v1/sub";if(fmt==="clash"){ep="/sub";p.append("format","clash");if(sni)p.append("host",sni)}else{p.append("format",fmt)}';
-  s += 'document.getElementById("res").value=location.origin+ep+"?"+p.toString()}';
-  s += '</script></body></html>';
-  return s;
-}
+// Base64 encoded HTML to prevent string parser errors in Worker environment
+const BASE64_HTML = "PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+CjxtZXRhIGNoYXJzZXQ9IlVURi04Ij4KPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiPgo8dGl0bGU+QWVnaXIgR2VuZXJhdG9yPC90aXRsZT4KPHN0eWxlPgo6cm9vdHstLXA6IzAwZjJlYTstLWI6IzExMTstLXQ6I2ZmZn0KYm9keXtiYWNrZ3JvdW5kOiMwNTA1MDU7Y29sb3I6dmFyKC0tdCk7Zm9udC1mYW1pbHk6c2Fucy1zZXJpZjtkaXNwbGF5OmZsZXg7anVzdGlmeS1jb250ZW50OmNlbnRlcjtwYWRkaW5nOjIwcHh9Ci5je2JhY2tncm91bmQ6dmFyKC0tYik7cGFkZGluZzoyMHB4O2JvcmRlci1yYWRpdXM6MTBweDt3aWR0aDoxMDAlO21heC13aWR0aDo0MDBweDtib3JkZXI6MXB4IHNvbGlkICMzMzN9CmxhYmVse2Rpc3BsYXk6YmxvY2s7Y29sb3I6Izg4ODttYXJnaW46MTBweCAwIDVweDtmb250LXNpemU6MC45ZW19CmlucHV0LHNlbGVjdCxidXR0b257d2lkdGg6MTAwJTtwYWRkaW5nOjEwcHg7YmFja2dyb3VuZDojMjIyO2JvcmRlcjoxcHggc29saWQgIzQ0NDtjb2xvcjojZmZmO2JvcmRlci1yYWRpdXM6NXB4O2JveC1zaXppbmc6Ym9yZGVyLWJveH0KYnV0dG9ue2JhY2tncm91bmQ6dmFyKC0tcCk7Y29sb3I6IzAwMDtmb250LXdlaWdodDpib2xkO21hcmdpbi10b3A6MjBweDtjdXJzb3I6cG9pbnRlcjtib3JkZXI6bm9uZX0KPC9zdHlsZT4KPC9oZWFkPgo8Ym9keT4KPGRpdiBjbGFzcz0iYyI+CjxoMiBzdHlsZT0idGV4dC1hbGlnbjpjZW50ZXI7Y29sb3I6dmFyKC0tcCkiPkFlZ2lyIPCfjIo8L2gyPgo8bGFiZWw+QnVnIElQL0hvc3Q8L2xhYmVsPjxpbnB1dCBpZD0iYnVnIiBwbGFjZWhvbGRlcj0iQXV0byI+CjxsYWJlbD5TTkkvV1MgSG9zdDwvbGFiZWw+PGlucHV0IGlkPSJzbmkiIHBsYWNlaG9sZGVyPSJBdXRvIj4KPGxhYmVsPkNDPC9sYWJlbD48aW5wdXQgaWQ9ImNjIiBwbGFjZWhvbGRlcj0iZS5nLiBTRyI+CjxsYWJlbD5MaW1pdDwvbGFiZWw+PHNlbGVjdCBpZD0ibGltIj48b3B0aW9uIHZhbHVlPSIxIj4xPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iMTAiPjEwPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iNTAiIHNlbGVjdGVkPjUwPC9vcHRpb24+PC9zZWxlY3Q+CjxsYWJlbD5Gb3JtYXQ8L2xhYmVsPjxzZWxlY3QgaWQ9ImZtdCI+PG9wdGlvbiB2YWx1ZT0icmF3Ij5SYXc8L29wdGlvbj48b3B0aW9uIHZhbHVlPSJ2MnJheSI+VjJSYXk8L29wdGlvbj48b3B0aW9uIHZhbHVlPSJjbGFzaCI+Q2xhc2g8L29wdGlvbj48L3NlbGVjdD4KPGJ1dHRvbiBvbmNsaWNrPSJnKCkiPkdlbmVyYXRlPC9idXR0b24+CjxkaXYgaWQ9InJlcyIgc3R5bGU9Im1hcmdpbi10b3A6MTVweDt3b3JkLWJyZWFrOmJyZWFrLWFsbDtjb2xvcjojMGYwO2ZvbnQtZmFtaWx5Om1vbm9zcGFjZTtmb250LXNpemU6MC45ZW0iPjwvZGl2Pgo8L2Rpdj4KPHNjcmlwdD4KZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2J1ZycpLnBsYWNlaG9sZGVyPWxvY2F0aW9uLmhvc3RuYW1lOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc25pJykucGxhY2Vob2xkZXI9bG9jYXRpb24uaG9zdG5hbWU7CmZ1bmN0aW9uIGcoKXsKdmFyIGI9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2J1ZycpLnZhbHVlLHM9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NuaScpLnZhbHVlLGM9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2NjJykudmFsdWUsbD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbGltJykudmFsdWUsZj1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZm10JykudmFsdWU7CnZhciB1PW5ldyBVUkxTZWFyY2hQYXJhbXMoKTsKaWYoYil1LmFwcGVuZCgnZG9tYWluJyxiKTsKaWYocyl1LmFwcGVuZCgnc25pJyxzKTsKaWYoYyl1LmFwcGVuZCgnY2MnLGMpOwp1LmFwcGVuZCgnbGltaXQnLGwpOwp2YXIgcD0nL2FwaS92MS9zdWInOwppZihmPT09J2NsYXNoJyl7cD0nL3N1Yic7dS5hcHBlbmQoJ2Zvcm1hdCcsJ2NsYXNoJyk7aWYocyl1LmFwcGVuZCgnaG9zdCcscyl9ZWxzZXt1LmFwcGVuZCgnZm9ybWF0JyxmKX0KZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3JlcycpLmlubmVyVGV4dD1sb2NhdGlvbi5vcmlnaW4rcCsnPycrdQp9Cjwvc2NyaXB0Pgo8L2JvZHk+CjwvaHRtbD4=";
 
 // Helper functions
 function getRequestKey(request) {
@@ -157,7 +139,9 @@ export default {
 
       // ROUTING LOGIC
       if (url.pathname === "/" || url.pathname === "/sub") {
-        return new Response(getWebUI(), { 
+        // Decode Base64 HTML at runtime to bypass parser errors
+        const html = atob(BASE64_HTML);
+        return new Response(html, { 
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             "Cache-Control": "public, max-age=3600"
@@ -193,10 +177,7 @@ export default {
               const filterLimit = Math.min(+url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST, MAX_CONFIGS_PER_REQUEST);
               const filterFormat = url.searchParams.get("format") || "raw";
               
-              // NEW LOGIC: Bug Address maps to 'domain' param (fillerDomain)
               const fillerDomain = url.searchParams.get("domain") || appDomain;
-              
-              // NEW LOGIC: SNI Override
               const customSNI = url.searchParams.get("sni") || url.searchParams.get("host") || appDomain;
 
               const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
@@ -229,12 +210,10 @@ export default {
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
                 responseHeaders["X-Streaming-Mode"] = "ACTIVE";
                 addCacheHeaders(responseHeaders, 3600, 1800);
-                // Pass customSNI as the appDomain argument
                 const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, customSNI, serviceName);
                 return createStreamingResponse(configStream, responseHeaders, filterFormat);
               } else if (filterFormat === PROTOCOL_V2) {
                 const result = [];
-                // Pass customSNI as the appDomain argument
                 const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, customSNI, serviceName);
                 for await (const config of configStream) result.push(config);
                 const finalResult = btoa(result.join("\n"));
@@ -244,7 +223,6 @@ export default {
                 return new Response(finalResult, { status: 200, headers: responseHeaders });
               } else {
                  const result = [];
-                 // Pass customSNI as the appDomain argument
                  const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, customSNI, serviceName);
                  for await (const config of configStream) result.push(config);
                  
