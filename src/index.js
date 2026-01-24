@@ -24,7 +24,7 @@ import { getKVPrxList, getPrxListPaginated } from './services/proxyProvider.js';
 import { generateConfigsStream, createStreamingResponse } from './services/configGenerator.js';
 import { reverseWeb } from './services/httpReverse.js';
 import { prewarmDNS, cleanupDNSCache, fetchWithDNS } from './services/dns.js';
-// REMOVED: import indexHtml from './pages/index.html'; -- ES Modules in Workers cannot import HTML directly without a bundler loader
+// REMOVED: import indexHtml from './pages/index.html';
 
 // CONSTANT HTML CONTENT INLINE
 const INDEX_HTML = `<!DOCTYPE html>
@@ -193,7 +193,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ... (getRequestKey, deduplicateRequest, getCacheKey, handleCachedRequest logic same as before) ...
+// Helper functions (kept inline for simplicity and integrity)
 function getRequestKey(request) {
   const url = new URL(request.url);
   const params = new URLSearchParams();
@@ -255,7 +255,7 @@ async function handleCachedRequest(request, handler) {
     const responseToCache = response.clone();
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('X-Cache-Status', 'MISS');
-    await cache.put(cacheKey, responseToCache);
+    await cache.put(cacheKey, responseToCache); // Non-blocking in CF Workers often
     return newResponse;
   }
   return response;
@@ -281,7 +281,8 @@ export default {
       const appDomain = url.hostname;
       const serviceName = appDomain.split(".")[0];
 
-      if (dnsCache.size === 0) ctx.waitUntil(prewarmDNS());
+      // Safe access to DNS cache map
+      if (dnsCache && dnsCache.size === 0) ctx.waitUntil(prewarmDNS());
       if (Math.random() < 0.1) ctx.waitUntil(Promise.resolve().then(cleanupDNSCache));
 
       const upgradeHeader = request.headers.get("Upgrade");
@@ -292,7 +293,7 @@ export default {
           const prxKeys = url.pathname.replace("/", "").toUpperCase().split(",");
           const prxKey = prxKeys[Math.floor(Math.random() * prxKeys.length)];
           const kvPrx = await getKVPrxList(KV_PRX_URL, env);
-          if(kvPrx[prxKey]) {
+          if(kvPrx && kvPrx[prxKey]) {
             prxIP = kvPrx[prxKey][Math.floor(Math.random() * kvPrx[prxKey].length)];
           }
           return await websocketHandler(request, prxIP);
@@ -302,11 +303,11 @@ export default {
         }
       }
 
-      // ROUTING LOGIC FIX
+      // ROUTING LOGIC
       
       // 1. Root Path / Sub Path -> Serve Built-in Generator
       if (url.pathname === "/" || url.pathname === "/sub") {
-        return new Response(INDEX_HTML, { // Serve Inline HTML
+        return new Response(INDEX_HTML, { 
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             "Cache-Control": "public, max-age=3600"
@@ -315,8 +316,10 @@ export default {
       } 
       
       else if (url.pathname.startsWith("/check")) {
-        // ... (Health check logic)
-         const target = url.searchParams.get("target").split(":");
+         const target = url.searchParams.get("target")?.split(":") || [];
+         if (target.length < 1) {
+             return new Response(JSON.stringify({ error: "Invalid target" }), { status: 400 });
+         }
         const resultPromise = checkPrxHealth(target[0], target[1] || "443");
         const result = await Promise.race([
           resultPromise,
@@ -330,7 +333,6 @@ export default {
       
       else if (url.pathname.startsWith("/api/v1")) {
          const apiPath = url.pathname.replace("/api/v1", "");
-         // ... (API logic same as before)
          if (apiPath.startsWith("/sub")) {
           return deduplicateRequest(request, () => {
             return handleCachedRequest(request, async () => {
@@ -383,7 +385,6 @@ export default {
                 addCacheHeaders(responseHeaders, 3600, 1800);
                 return new Response(finalResult, { status: 200, headers: responseHeaders });
               } else {
-                 // Converter logic (neko, etc)
                  const result = [];
                  const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, appDomain, serviceName);
                  for await (const config of configStream) result.push(config);
