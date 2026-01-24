@@ -24,58 +24,75 @@ async function fetchProxies() {
 }
 
 function processProxies(proxies) {
-  // Debug one item to check structure
   if (proxies.length > 0) {
-    console.log('[Scan] Sample proxy item:', JSON.stringify(proxies[0]));
+    console.log('[Scan] Sample proxy item (Raw):', JSON.stringify(proxies[0]));
   }
   
-  // Format: IP,Port,CC,Org
   const processed = proxies.map(p => {
-    // Monosans structure: {"ip": "...", "port": ..., "protocol": "http", "country": {"code": "US", "name": "United States"}, "as": {"number": 123, "name": "Google", "organization": "Google LLC"}}
-    // OR sometimes flat structure depending on the exact file. 
-    // Let's handle nested objects carefully.
-    
+    // 1. IP Parsing
     const ip = p.ip || p.host || p.address;
+    
+    // 2. Port Parsing
     const port = p.port;
     
-    // Handle Country (nested object or string)
+    // 3. Country Parsing (Aggressive Flattening)
     let cc = 'XX';
-    if (typeof p.country === 'object' && p.country !== null) {
-      cc = p.country.code || 'XX';
-    } else if (typeof p.country === 'string') {
-      cc = p.country;
-    } else if (p.geolocation && p.geolocation.country) {
-      cc = p.geolocation.country;
+    try {
+      if (!p.country) {
+        cc = 'XX';
+      } else if (typeof p.country === 'string') {
+        cc = p.country;
+      } else if (typeof p.country === 'object') {
+        // Try common keys
+        cc = p.country.code || p.country.iso || p.country.id || p.country.name || 'XX';
+        
+        // Final sanity check: if it's STILL an object (e.g. nested deeper), force XX
+        if (typeof cc === 'object') {
+          console.warn('[Scan] Nested country object found, defaulting to XX:', JSON.stringify(p.country));
+          cc = 'XX';
+        }
+      }
+    } catch (e) {
+      cc = 'XX';
     }
 
-    // Handle Org/AS (nested object or string)
+    // 4. Org/AS Parsing
     let orgRaw = 'Unknown';
-    if (typeof p.as === 'object' && p.as !== null) {
-      orgRaw = p.as.organization || p.as.name || 'Unknown';
-    } else if (p.org) {
-      orgRaw = p.org;
-    } else if (p.isp) {
-      orgRaw = p.isp;
+    try {
+      if (p.org) orgRaw = p.org;
+      else if (p.isp) orgRaw = p.isp;
+      else if (p.as) {
+        if (typeof p.as === 'string') orgRaw = p.as;
+        else if (typeof p.as === 'object') {
+          orgRaw = p.as.organization || p.as.name || p.as.number || 'Unknown';
+        }
+      }
+    } catch (e) {
+      orgRaw = 'Unknown';
     }
 
-    // Sanitize
-    const org = String(orgRaw).replace(/,/g, ' ').trim();
-    const safeIP = String(ip).trim();
-    const safePort = String(port).trim();
-    const safeCC = String(cc).trim();
+    // 5. Sanitization (Crucial step)
+    const safeIP = String(ip || '').trim();
+    const safePort = String(port || '').trim();
+    const safeCC = String(cc || 'XX').trim().toUpperCase().substring(0, 2); // Force 2 chars
+    const safeOrg = String(orgRaw || 'Unknown').replace(/,/g, ' ').replace(/[\r\n]/g, '').trim();
     
-    if (!safeIP || safeIP === 'undefined' || safeIP === '[object Object]') {
-      return null; // Invalid item
-    }
+    // Validation
+    if (!safeIP || safeIP === 'undefined' || safeIP === '[object Object]') return null;
+    if (!safePort || isNaN(safePort)) return null;
 
     return {
       ip: safeIP,
       port: safePort,
       cc: safeCC,
-      org: org,
-      line: `${safeIP},${safePort},${safeCC},${org}`
+      org: safeOrg,
+      line: `${safeIP},${safePort},${safeCC},${safeOrg}`
     };
-  }).filter(Boolean); // Remove nulls
+  }).filter(Boolean);
+
+  if (processed.length > 0) {
+    console.log('[Scan] Sample processed item:', processed[0]);
+  }
 
   return processed;
 }
@@ -97,7 +114,7 @@ async function run() {
   const kvMap = {};
   
   for (const p of processed) {
-    const cc = p.cc.toUpperCase();
+    const cc = p.cc;
     if (!kvMap[cc]) kvMap[cc] = [];
     
     if (kvMap[cc].length < MAX_PROXIES_PER_COUNTRY) {
