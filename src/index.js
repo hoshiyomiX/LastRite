@@ -31,57 +31,115 @@ function getWebUI() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aegir WebUI</title>
+<title>Aegir Config Generator</title>
 <style>
-:root { --accent: #00f2ea; --bg: #050505; --panel: #111; --text: #eee; }
-body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-.card { background: var(--panel); padding: 2rem; border-radius: 12px; border: 1px solid #222; width: 100%; max-width: 420px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
-h2 { text-align: center; color: var(--accent); margin-top: 0; }
-label { display: block; margin: 10px 0 5px; font-size: 0.9em; color: #aaa; }
-input, select, button { width: 100%; padding: 12px; background: #222; border: 1px solid #333; color: white; border-radius: 6px; margin-bottom: 5px; font-size: 14px; box-sizing: border-box; }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
-button { background: var(--accent); color: black; font-weight: bold; cursor: pointer; border: none; margin-top: 15px; }
-button:hover { opacity: 0.9; }
-.result { margin-top: 20px; padding: 10px; background: #000; border-radius: 6px; font-family: monospace; font-size: 12px; word-break: break-all; display: none; color: #0f0; }
+:root { --accent: #00f2ea; --accent-hover: #00c2bb; --bg: #050505; --panel: #111; --text: #eee; --border: #333; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 10px; }
+.card { background: var(--panel); padding: 2rem; border-radius: 16px; border: 1px solid var(--border); width: 100%; max-width: 450px; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+h2 { text-align: center; color: var(--accent); margin: 0 0 20px 0; font-weight: 800; letter-spacing: 1px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.full { grid-column: span 2; }
+label { display: block; margin: 8px 0 4px; font-size: 0.85em; color: #888; text-transform: uppercase; font-weight: 600; }
+input, select, button { width: 100%; padding: 12px; background: #1a1a1a; border: 1px solid var(--border); color: white; border-radius: 8px; font-size: 14px; box-sizing: border-box; transition: 0.2s; }
+input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0, 242, 234, 0.1); background: #222; }
+button { background: linear-gradient(135deg, var(--accent), var(--accent-hover)); color: #000; font-weight: 800; border: none; margin-top: 20px; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; }
+button:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0, 242, 234, 0.2); }
+.result-area { margin-top: 20px; display: none; }
+textarea { width: 100%; height: 120px; background: #000; border: 1px solid var(--border); color: #0f0; padding: 10px; border-radius: 8px; font-family: monospace; font-size: 11px; resize: vertical; }
+.tools { margin-top: 10px; display: flex; gap: 10px; }
+.tools button { margin-top: 0; background: #333; color: white; font-size: 12px; padding: 8px; }
+.tools button:hover { background: #444; }
+.badge { display: inline-block; padding: 2px 6px; background: #222; border-radius: 4px; font-size: 10px; color: #aaa; margin-left: 5px; border: 1px solid #333; }
 </style>
 </head>
 <body>
 <div class="card">
-  <h2>Aegir WebUI</h2>
-  <label>Target Domain (SNI)</label>
-  <input id="sni" type="text" placeholder="example.com">
+  <h2>Aegir 🌊 <span style="font-size:0.5em; color:#666">v2.1</span></h2>
   
-  <label>Config Format</label>
-  <select id="fmt">
-    <option value="raw">Raw (Clash/Meta)</option>
-    <option value="v2ray">V2Ray / Xray</option>
-    <option value="clash">Clash Provider</option>
-  </select>
+  <div class="grid">
+    <div class="full">
+      <label>Bug Address / IP <span class="badge">Server</span></label>
+      <input id="bug" type="text" placeholder="e.g. 104.16.x.x or bug.com">
+    </div>
 
-  <button onclick="gen()">Generate Link</button>
-  <div id="out" class="result"></div>
+    <div class="full">
+      <label>SNI / WS Host <span class="badge">Header</span></label>
+      <input id="sni" type="text" placeholder="Defaults to current worker">
+    </div>
+
+    <div>
+      <label>Country (CC)</label>
+      <input id="cc" type="text" placeholder="SG,ID,JP (Empty=All)">
+    </div>
+    
+    <div>
+      <label>Limit</label>
+      <select id="limit">
+        <option value="1">Single (1)</option>
+        <option value="10">List (10)</option>
+        <option value="50" selected>Bulk (50)</option>
+      </select>
+    </div>
+
+    <div class="full">
+      <label>Format</label>
+      <select id="fmt">
+        <option value="raw">Raw (Clash/Meta/Surfboard)</option>
+        <option value="v2ray">V2Ray / Xray (Base64)</option>
+        <option value="clash">Clash Provider (YAML)</option>
+      </select>
+    </div>
+  </div>
+
+  <button onclick="gen()">Generate Config</button>
+
+  <div id="res" class="result-area">
+    <label>Generated Subscription URL</label>
+    <input id="url-out" type="text" readonly onclick="this.select()">
+    
+    <div style="margin-top:10px; text-align:right">
+        <a id="test-link" href="#" target="_blank" style="color:var(--accent); font-size:12px; text-decoration:none">Test/Open Link &rarr;</a>
+    </div>
+  </div>
 </div>
+
 <script>
-  // Initialize
-  document.getElementById('sni').value = window.location.hostname;
+  document.getElementById('sni').placeholder = window.location.hostname;
+  document.getElementById('bug').placeholder = window.location.hostname;
 
   function gen() {
-    var sni = document.getElementById('sni').value || window.location.hostname;
-    var fmt = document.getElementById('fmt').value;
-    var origin = window.location.origin;
-    var url = "";
+    const bug = document.getElementById('bug').value.trim();
+    const sni = document.getElementById('sni').value.trim();
+    const cc = document.getElementById('cc').value.trim();
+    const limit = document.getElementById('limit').value;
+    const fmt = document.getElementById('fmt').value;
+    const origin = window.location.origin;
 
+    const params = new URLSearchParams();
+    if (bug) params.append('domain', bug); // domain param maps to fillerDomain (Address)
+    if (sni) params.append('sni', sni);    // sni param maps to appDomain (Host/SNI)
+    if (cc) params.append('cc', cc.toUpperCase());
+    params.append('limit', limit);
+    
+    // Format handling
+    let endpoint = '/api/v1/sub';
     if (fmt === 'clash') {
-      url = origin + '/sub?host=' + sni + '&format=clash';
-    } else if (fmt === 'v2ray') {
-      url = origin + '/api/v1/sub?host=' + sni + '&format=v2ray';
+        endpoint = '/sub';
+        params.append('format', 'clash');
     } else {
-      url = origin + '/api/v1/sub?host=' + sni + '&format=raw';
+        params.append('format', fmt);
+    }
+    
+    // Special handling for old /sub endpoint expecting 'host' instead of 'sni'
+    if (fmt === 'clash') {
+        if (sni) params.append('host', sni);
     }
 
-    var out = document.getElementById('out');
-    out.innerText = url;
-    out.style.display = 'block';
+    const finalUrl = origin + endpoint + '?' + params.toString();
+    
+    document.getElementById('res').style.display = 'block';
+    document.getElementById('url-out').value = finalUrl;
+    document.getElementById('test-link').href = finalUrl;
   }
 </script>
 </body>
@@ -92,7 +150,7 @@ button:hover { opacity: 0.9; }
 function getRequestKey(request) {
   const url = new URL(request.url);
   const params = new URLSearchParams();
-  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
+  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list', 'sni', 'host'];
   for (const key of paramKeys) {
     const value = url.searchParams.get(key);
     if (value) params.set(key, value);
@@ -125,7 +183,7 @@ async function deduplicateRequest(request, handler) {
 function getCacheKey(request) {
   const url = new URL(request.url);
   const params = new URLSearchParams();
-  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list'];
+  const paramKeys = ['offset', 'limit', 'cc', 'port', 'vpn', 'format', 'domain', 'prx-list', 'sni', 'host'];
   for (const key of paramKeys) {
     const value = url.searchParams.get(key);
     if (value) params.set(key, value);
@@ -234,7 +292,13 @@ export default {
               const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
               const filterLimit = Math.min(+url.searchParams.get("limit") || MAX_CONFIGS_PER_REQUEST, MAX_CONFIGS_PER_REQUEST);
               const filterFormat = url.searchParams.get("format") || "raw";
+              
+              // NEW LOGIC: Bug Address maps to 'domain' param (fillerDomain)
               const fillerDomain = url.searchParams.get("domain") || appDomain;
+              
+              // NEW LOGIC: SNI Override
+              const customSNI = url.searchParams.get("sni") || url.searchParams.get("host") || appDomain;
+
               const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL || PRX_BANK_URL;
               
               const { data: prxList, pagination } = await getPrxListPaginated(prxBankUrl, { offset, limit: filterLimit, filterCC }, env);
@@ -265,11 +329,13 @@ export default {
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
                 responseHeaders["X-Streaming-Mode"] = "ACTIVE";
                 addCacheHeaders(responseHeaders, 3600, 1800);
-                const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, appDomain, serviceName);
+                // Pass customSNI as the appDomain argument
+                const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, customSNI, serviceName);
                 return createStreamingResponse(configStream, responseHeaders, filterFormat);
               } else if (filterFormat === PROTOCOL_V2) {
                 const result = [];
-                const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, appDomain, serviceName);
+                // Pass customSNI as the appDomain argument
+                const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, customSNI, serviceName);
                 for await (const config of configStream) result.push(config);
                 const finalResult = btoa(result.join("\n"));
                 responseHeaders["Content-Type"] = "text/plain; charset=utf-8";
@@ -278,7 +344,8 @@ export default {
                 return new Response(finalResult, { status: 200, headers: responseHeaders });
               } else {
                  const result = [];
-                 const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, appDomain, serviceName);
+                 // Pass customSNI as the appDomain argument
+                 const configStream = generateConfigsStream(prxList, filterPort, filterVPN, filterLimit, fillerDomain, uuid, ssUsername, customSNI, serviceName);
                  for await (const config of configStream) result.push(config);
                  
                  const converterPromise = fetchWithDNS(CONVERTER_URL, {
