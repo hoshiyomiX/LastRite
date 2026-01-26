@@ -22,11 +22,9 @@ export async function websocketHandler(request, prxIP) {
 
   webSocket.accept();
 
-  // Optimization: Disable logging in production for performance
-  const addressLog = ""; 
-  const portLog = "";
+  // DEBUG MODE ENABLED
   const log = (info, event) => {
-    // console.log(`[${addressLog}:${portLog}] ${info}`, event || "");
+    console.log(`[Aegir-Debug] ${info}`, event ? JSON.stringify(event) : "");
   };
   
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
@@ -84,6 +82,7 @@ export async function websocketHandler(request, prxIP) {
           if (protocolHeader.isUDP) {
             if (protocolHeader.portRemote === 53) {
               isDNS = true;
+              log(`UDP DNS Query detected -> ${DNS_SERVER_ADDRESS}:53`);
               return handleUDPOutbound(
                 DNS_SERVER_ADDRESS,
                 DNS_SERVER_PORT,
@@ -95,6 +94,7 @@ export async function websocketHandler(request, prxIP) {
               );
             }
 
+            log(`UDP Game/Traffic detected -> ${protocolHeader.addressRemote}:${protocolHeader.portRemote}`);
             return handleUDPOutbound(
               protocolHeader.addressRemote,
               protocolHeader.portRemote,
@@ -114,19 +114,19 @@ export async function websocketHandler(request, prxIP) {
             webSocket,
             protocolHeader.version,
             log,
-            prxIP // This is the proxy override IP passed from index.js
+            prxIP 
           );
         },
         close() {
           log(`readableWebSocketStream is close`);
         },
         abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
+          log(`readableWebSocketStream is abort`, reason);
         },
       })
     )
     .catch((err) => {
-      log("readableWebSocketStream pipeTo error", err);
+      log("readableWebSocketStream pipeTo error", err.message);
     });
 
   return new Response(null, {
@@ -154,16 +154,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         controller.close();
       });
       webSocketServer.addEventListener("error", (err) => {
-        // Only log serious errors
-        /*
-        log("WebSocket error:", {
-          message: err.message || 'Unknown error',
-          type: err.type || 'Unknown type',
-          code: err.code,
-          readyState: webSocketServer.readyState,
-          timestamp: new Date().toISOString()
-        });
-        */
+        log("WebSocket error:", err.message);
         controller.error(err);
       });
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
