@@ -93,7 +93,7 @@ export async function handleTCPOutBound(
     await sleep(delay);
     
     try {
-      // Logic Fix: Ensure retry uses the correct Target IP (Proxy Override if available)
+      // Logic Restored: Use Proxy IP only for retries (Fallback mechanism)
       const targetAddress = (prxIP && prxIP.split(/[:=-]/)[0]) || addressRemote;
       const targetPort = (prxIP && prxIP.split(/[:=-]/)[1]) || portRemote;
 
@@ -122,11 +122,9 @@ export async function handleTCPOutBound(
   }
 
   try {
-    // Logic Fix: Ensure initial connection uses Proxy Override if available
-    const targetAddress = (prxIP && prxIP.split(/[:=-]/)[0]) || addressRemote;
-    const targetPort = (prxIP && prxIP.split(/[:=-]/)[1]) || portRemote;
-
-    const tcpSocket = await connectAndWrite(targetAddress, targetPort);
+    // REVERT: Initial connection should use DIRECT addressRemote
+    // Only retries use the Proxy IP (if configured)
+    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
     remoteSocketToWS(tcpSocket, webSocket, responseHeader, retryWithBackoff, log, addressRemote, portRemote);
   } catch (err) {
     if(log) log("TCP: Initial connection failed", err.message);
