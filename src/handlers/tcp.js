@@ -53,12 +53,7 @@ export async function handleTCPOutBound(
         // OPTIMIZATION 14: Record latency for future adaptive calculations
         recordLatency(address, port, connectTime);
         
-        if (connectTime > adaptiveTimeout * 0.8) {
-          timeoutStats.slowSuccess++;
-          if(log) log(`Slow but successful connect: ${address}:${port} (${connectTime}ms)`);
-        }
-        
-        if(log) log(`connected to ${address}:${port} in ${connectTime}ms`);
+        if(log) log(`TCP: Connected to ${address}:${port} in ${connectTime}ms`);
         const writer = tcpSocket.writable.getWriter();
         await writer.write(rawClientData);
         writer.releaseLock();
@@ -82,7 +77,7 @@ export async function handleTCPOutBound(
   async function retryWithBackoff(attempt = 0) {
     if (attempt >= RETRY_MAX_ATTEMPTS) {
       retryStats.failures++;
-      if(log) log(`Max retry attempts (${RETRY_MAX_ATTEMPTS}) exceeded`);
+      if(log) log(`TCP: Max retry attempts (${RETRY_MAX_ATTEMPTS}) exceeded`);
       safeCloseWebSocket(webSocket);
       return;
     }
@@ -92,20 +87,24 @@ export async function handleTCPOutBound(
     retryStats.attempts++;
     retryStats.totalDelay += delay;
     
-    if(log) log(`Retry attempt ${attempt + 1}/${RETRY_MAX_ATTEMPTS} after ${delay}ms backoff`);
+    if(log) log(`TCP: Retry attempt ${attempt + 1}/${RETRY_MAX_ATTEMPTS} after ${delay}ms backoff`);
     
     // Wait with exponential backoff + jitter
     await sleep(delay);
     
     try {
+      // Logic Fix: Ensure retry uses the correct Target IP (Proxy Override if available)
+      const targetAddress = (prxIP && prxIP.split(/[:=-]/)[0]) || addressRemote;
+      const targetPort = (prxIP && prxIP.split(/[:=-]/)[1]) || portRemote;
+
       const tcpSocket = await connectAndWrite(
-        (prxIP && prxIP.split(/[:=-]/)[0]) || addressRemote,
-        (prxIP && prxIP.split(/[:=-]/)[1]) || portRemote,
+        targetAddress,
+        targetPort,
         false // Don't use pool on retry
       );
       
       retryStats.successes++;
-      if(log) log(`Retry succeeded on attempt ${attempt + 1}`);
+      if(log) log(`TCP: Retry succeeded on attempt ${attempt + 1}`);
       
       tcpSocket.closed
         .catch((error) => {
@@ -116,17 +115,21 @@ export async function handleTCPOutBound(
         });
       remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log, addressRemote, portRemote);
     } catch (err) {
-      if(log) log(`Retry attempt ${attempt + 1} failed:`, err.message);
+      if(log) log(`TCP: Retry attempt ${attempt + 1} failed:`, err.message);
       // Recursive retry with incremented attempt
       await retryWithBackoff(attempt + 1);
     }
   }
 
   try {
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    // Logic Fix: Ensure initial connection uses Proxy Override if available
+    const targetAddress = (prxIP && prxIP.split(/[:=-]/)[0]) || addressRemote;
+    const targetPort = (prxIP && prxIP.split(/[:=-]/)[1]) || portRemote;
+
+    const tcpSocket = await connectAndWrite(targetAddress, targetPort);
     remoteSocketToWS(tcpSocket, webSocket, responseHeader, retryWithBackoff, log, addressRemote, portRemote);
   } catch (err) {
-    if(log) log("TCP connection failed", err.message);
+    if(log) log("TCP: Initial connection failed", err.message);
     // Start retry sequence
     await retryWithBackoff(0);
   }
